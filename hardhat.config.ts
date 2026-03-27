@@ -22,14 +22,14 @@ import "./tasks/erc1155/base-uri";
 import "./tasks/erc1155/contract-uri";
 
 // Environment variable setup
-const RSK_MAINNET_RPC_URL = process.env.RSK_MAINNET_RPC_URL;
+// const RSK_MAINNET_RPC_URL = process.env.RSK_MAINNET_RPC_URL;
 const RSK_TESTNET_RPC_URL = process.env.RSK_TESTNET_RPC_URL;
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
 
 // Ensure environment variables are configured
-if (!RSK_MAINNET_RPC_URL) {
-    throw new Error("The RPC URL for the mainnet is not configured.");
-}
+// if (!RSK_MAINNET_RPC_URL) {
+//     throw new Error("The RPC URL for the mainnet is not configured.");
+// }
 
 if (!RSK_TESTNET_RPC_URL) { // Fixed duplicate check for RSK_MAINNET_RPC_URL
     throw new Error("The RPC URL for the testnet is not configured.");
@@ -52,12 +52,12 @@ const config: HardhatUserConfig = {
         localhost: {
             url: "http://127.0.0.1:8545",
         },
-        rskMainnet: {
-            url: RSK_MAINNET_RPC_URL,
-            chainId: 30,
-            gasPrice: 60000000,
-            accounts: [WALLET_PRIVATE_KEY]
-        },
+        // rskMainnet: {
+        //     url: RSK_MAINNET_RPC_URL,
+        //     chainId: 30,
+        //     gasPrice: 60000000,
+        //     accounts: [WALLET_PRIVATE_KEY]
+        // },
         rskTestnet: {
             url: RSK_TESTNET_RPC_URL,
             chainId: 31,
