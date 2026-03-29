@@ -310,7 +310,7 @@ rbtc-refuel/
 | No automated tests yet | Manual Remix testing only | Hardhat test suite planned |
 
 ---
-contract Verified At this link: https://rootstock-testnet.blockscout.com/address/0x5fA63395D7af43261513293976de0Da9fe8AA92C?tab=index
+contract Verified At this link: https://explorer.testnet.rootstock.io/address/0x0a7e749d4f2dd6dd1a8448acac3244dcbcfecacc
 ## License
 
 MIT

@@ -21,17 +21,10 @@ import "./tasks/erc1155/mint";
 import "./tasks/erc1155/base-uri";
 import "./tasks/erc1155/contract-uri";
 
-// Environment variable setup
-// const RSK_MAINNET_RPC_URL = process.env.RSK_MAINNET_RPC_URL;
 const RSK_TESTNET_RPC_URL = process.env.RSK_TESTNET_RPC_URL;
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
 
-// Ensure environment variables are configured
-// if (!RSK_MAINNET_RPC_URL) {
-//     throw new Error("The RPC URL for the mainnet is not configured.");
-// }
-
-if (!RSK_TESTNET_RPC_URL) { // Fixed duplicate check for RSK_MAINNET_RPC_URL
+if (!RSK_TESTNET_RPC_URL) {
     throw new Error("The RPC URL for the testnet is not configured.");
 }
 
@@ -39,25 +32,13 @@ if (!WALLET_PRIVATE_KEY) {
     throw new Error("Private key is not configured.");
 }
 
-// Hardhat configuration
 const config: HardhatUserConfig = {
     defaultNetwork: "hardhat",
     networks: {
-        hardhat: {
-            // If you want to do some forking, uncomment this
-            // forking: {
-            //   url: MAINNET_RPC_URL
-            // }
-        },
+        hardhat: {},
         localhost: {
             url: "http://127.0.0.1:8545",
         },
-        // rskMainnet: {
-        //     url: RSK_MAINNET_RPC_URL,
-        //     chainId: 30,
-        //     gasPrice: 60000000,
-        //     accounts: [WALLET_PRIVATE_KEY]
-        // },
         rskTestnet: {
             url: RSK_TESTNET_RPC_URL,
             chainId: 31,
@@ -67,7 +48,6 @@ const config: HardhatUserConfig = {
     },
     etherscan: {
         apiKey: {
-            // Is not required by blockscout. Can be any non-empty string
             rsktestnet: 'your API key',
             rskmainnet: 'your API key'
         },
@@ -92,7 +72,7 @@ const config: HardhatUserConfig = {
     },
     namedAccounts: {
         deployer: {
-            default: 0, // Default is the first account
+            default: 0,
             mainnet: 0,
         },
         owner: {
@@ -102,7 +82,13 @@ const config: HardhatUserConfig = {
     solidity: {
         compilers: [
             {
-                version: "0.8.25",
+                version: "0.8.20",
+                settings: {
+                    evmVersion: "london", // ✅ RSK testnet supports london
+                    optimizer: {
+                        enabled: false
+                    }
+                }
             },
         ],
     },
