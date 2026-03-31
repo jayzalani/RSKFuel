@@ -10,17 +10,35 @@ export default function Home() {
   const contract = useContractState();
 
   return (
-    <main style={{ minHeight: "100vh", display: "flex", flexDirection: "column", position: "relative" }}>
-      {/* Background glow */}
-      <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0 }}>
-        <div style={{ position: "absolute", top: "5%", left: "50%", transform: "translateX(-50%)", width: 700, height: 400, background: "radial-gradient(ellipse, rgba(255,107,53,.07) 0%, transparent 70%)", filter: "blur(40px)" }} />
-        <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: .025 }}>
+    <main style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+      {/* Subtle ambient background */}
+      
+      <div style={{
+        position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0, overflow: "hidden",
+      }}>
+        {/* Top centre warm glow */}
+        <div style={{
+          position: "absolute",
+          top: "-10%", left: "50%",
+          transform: "translateX(-50%)",
+          width: 600, height: 500,
+          background: "radial-gradient(ellipse, rgba(232,103,58,.06) 0%, transparent 65%)",
+        }} />
+        {/* Bottom right accent */}
+        <div style={{
+          position: "absolute",
+          bottom: "-5%", right: "10%",
+          width: 300, height: 300,
+          background: "radial-gradient(ellipse, rgba(201,151,58,.04) 0%, transparent 70%)",
+        }} />
+        {/* Dot grid texture */}
+        <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: .03 }}>
           <defs>
-            <pattern id="g" width="56" height="56" patternUnits="userSpaceOnUse">
-              <path d="M 56 0 L 0 0 0 56" fill="none" stroke="#FF6B35" strokeWidth=".5" />
+            <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+              <circle cx="1" cy="1" r="1" fill="#F5F0E8" />
             </pattern>
           </defs>
-          <rect width="100%" height="100%" fill="url(#g)" />
+          <rect width="100%" height="100%" fill="url(#dots)" />
         </svg>
       </div>
 
@@ -28,19 +46,61 @@ export default function Home() {
       <div style={{ position: "relative", zIndex: 1, display: "flex", flexDirection: "column", minHeight: "100vh" }}>
         <Header wallet={wallet} />
 
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 16px", gap: 24 }}>
+        <div style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "48px 20px 40px",
+          gap: 28,
+        }}>
           {/* Hero */}
-          <div style={{ textAlign: "center", maxWidth: 480 }}>
-            <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(255,107,53,.1)", border: "1px solid rgba(255,107,53,.3)", borderRadius: 20, padding: "3px 12px", fontSize: 11, fontFamily: "JetBrains Mono", color: "var(--orange)", marginBottom: 18 }}>
-              <span className="pulse" style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--orange)", display: "inline-block" }} />
-              RSK Testnet · Live
+          <div style={{ textAlign: "center", maxWidth: 500 }} className="fade-up">
+            {/* Status pill */}
+            <div style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
+              border: "1px solid var(--border)",
+              borderRadius: 20,
+              padding: "4px 12px 4px 10px",
+              fontSize: 10,
+              fontFamily: "Geist Mono",
+              color: "var(--sub)",
+              letterSpacing: "0.08em",
+              marginBottom: 22,
+            }}>
+              <span className="pulse" style={{
+                width: 5, height: 5, borderRadius: "50%",
+                background: "#5CB87A", display: "inline-block",
+              }} />
+              LIVE ON RSK TESTNET
             </div>
-            <h1 style={{ fontFamily: "Syne", fontWeight: 800, fontSize: "clamp(2rem,5vw,2.8rem)", lineHeight: 1.15, color: "var(--text)", marginBottom: 10 }}>
-              Refuel your{" "}
-              <span style={{ color: "var(--orange)", textShadow: "0 0 24px rgba(255,107,53,.4)" }}>RBTC</span>
+
+            <h1 style={{
+              fontFamily: "Instrument Serif",
+              fontStyle: "italic",
+              fontWeight: 400,
+              fontSize: "clamp(2.4rem, 6vw, 3.4rem)",
+              lineHeight: 1.1,
+              letterSpacing: "-0.02em",
+              color: "var(--cream)",
+              marginBottom: 14,
+            }}>
+              Refuel your RBTC
             </h1>
-            <p style={{ color: "var(--sub)", fontSize: 15, lineHeight: 1.6 }}>
-              Pay with USDRIF or RIF. Receive RBTC gas instantly — no bridges, no waiting.
+
+            <p style={{
+              color: "var(--sub)",
+              fontSize: 14,
+              lineHeight: 1.65,
+              fontWeight: 300,
+              maxWidth: 360,
+              margin: "0 auto",
+            }}>
+              Pay with USDRIF or RIF.<br />
+              Receive RBTC gas instantly — no bridges, no waiting.
             </p>
           </div>
 
@@ -48,10 +108,22 @@ export default function Home() {
           <SwapCard wallet={wallet} contract={contract} />
         </div>
 
-        <footer style={{ textAlign: "center", padding: "18px 0", fontSize: 11, fontFamily: "JetBrains Mono", color: "var(--sub)", borderTop: "1px solid var(--border)" }}>
-          Built on{" "}
-          <a href="https://rootstock.io" target="_blank" rel="noopener noreferrer" style={{ color: "var(--orange)", textDecoration: "none" }}>Rootstock</a>
-          {" "}· Testnet only
+        <footer style={{
+          textAlign: "center",
+          padding: "16px 0",
+          fontSize: 10,
+          fontFamily: "Geist Mono",
+          color: "var(--sub)",
+          borderTop: "1px solid var(--border)",
+          letterSpacing: "0.08em",
+        }}>
+          BUILT ON{" "}
+          <a
+            href="https://rootstock.io"
+            target="_blank" rel="noopener noreferrer"
+            style={{ color: "var(--accent)", textDecoration: "none" }}
+          >ROOTSTOCK</a>
+          {" "}· TESTNET ONLY
         </footer>
       </div>
     </main>

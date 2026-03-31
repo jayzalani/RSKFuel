@@ -1,44 +1,48 @@
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@300;400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist+Mono:wght@300;400;500;600&family=Geist:wght@300;400;500&display=swap');
 @import "tailwindcss";
+
 :root {
-  --orange: #FF6B35;
-  --gold:   #FFB347;
-  --dark:   #0A0A0F;
-  --panel:  #111118;
-  --border: #1E1E2E;
-  --muted:  #2A2A3E;
-  --text:   #E8E8F0;
-  --sub:    #8888AA;
+  --cream:  #F5F0E8;
+  --ink:    #0E0C0A;
+  --warm:   #1A1612;
+  --panel:  #141210;
+  --border: #252118;
+  --muted:  #1E1A15;
+  --sub:    #6B6357;
+  --text:   #E8E2D8;
+  --accent: #E8673A;
+  --gold:   #C9973A;
+  --glow:   rgba(232, 103, 58, 0.12);
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
-  background: var(--dark);
+  background: var(--ink);
   color: var(--text);
-  font-family: 'DM Sans', sans-serif;
+  font-family: 'Geist', sans-serif;
+  font-weight: 300;
   overflow-x: hidden;
 }
 
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-track { background: var(--dark); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--ink); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
 input[type=number]::-webkit-inner-spin-button,
 input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
 
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+@keyframes spin    { to { transform: rotate(360deg); } }
+@keyframes pulse   { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+@keyframes fade-up { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
 @keyframes shimmer { 0% { background-position:-200% center } 100% { background-position:200% center } }
+@keyframes ticker  { 0% { transform:translateX(0); } 100% { transform:translateX(-50%); } }
 
-.spin {
-  animation: spin 0.8s linear infinite;
-}
-.pulse {
-  animation: pulse 2s ease-in-out infinite;
-}
+.spin    { animation: spin 0.9s linear infinite; }
+.pulse   { animation: pulse 2.4s ease-in-out infinite; }
+.fade-up { animation: fade-up 0.5s cubic-bezier(0.16,1,0.3,1) forwards; }
 .shimmer {
-  background: linear-gradient(90deg, transparent, rgba(255,107,53,.12), transparent);
+  background: linear-gradient(90deg, transparent, rgba(232,103,58,.08), transparent);
   background-size: 200% 100%;
-  animation: shimmer 1.8s linear infinite;
+  animation: shimmer 2s linear infinite;
 }
