@@ -1,9 +1,11 @@
 "use client";
 import { ethers } from "ethers";
 import { ContractState } from "@/hooks/useContractState";
+import { useLivePrice } from "@/hooks/useLivePrice";
 import { formatRBTC } from "@/lib/utils";
 
 export function StatsBar({ c }: { c: ContractState }) {
+  const live = useLivePrice();
   const fmt = (v: bigint) => c.isLoading ? "—" : parseFloat(ethers.formatEther(v)).toFixed(0);
 
   const stats = [
@@ -16,60 +18,91 @@ export function StatsBar({ c }: { c: ContractState }) {
   ];
 
   return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "repeat(5, 1fr)",
-      width: "100%",
-      maxWidth: 680,
-      border: "1px solid var(--border)",
-      borderRadius: 14,
-      overflow: "hidden",
-      background: "var(--panel)",
-    }}>
-      {stats.map((s, i) => (
-        <div key={s.label} style={{
-          padding: "16px 18px",
-          borderRight: i < stats.length - 1 ? "1px solid var(--border)" : "none",
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-        }}>
-          <span style={{
-            fontSize: 9,
-            fontFamily: "Geist Mono",
-            fontWeight: 400,
-            color: "var(--sub)",
-            letterSpacing: "0.1em",
-            textTransform: "uppercase",
-          }}>{s.label}</span>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
-            {s.dot && (
-              <span style={{
-                width: 5, height: 5, borderRadius: "50%",
-                background: s.color,
-                display: "inline-block",
-                marginBottom: 1,
-                flexShrink: 0,
-              }} className={!c.paused && !c.isLoading ? "pulse" : ""} />
-            )}
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%", maxWidth: 680 }}>
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(5, 1fr)",
+        width: "100%",
+        border: "1px solid var(--border)",
+        borderRadius: 14,
+        overflow: "hidden",
+        background: "var(--panel)",
+      }}>
+        {stats.map((s, i) => (
+          <div key={s.label} style={{
+            padding: "16px 18px",
+            borderRight: i < stats.length - 1 ? "1px solid var(--border)" : "none",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}>
             <span style={{
-              fontSize: 15,
+              fontSize: 9,
               fontFamily: "Geist Mono",
-              fontWeight: 500,
-              color: s.color ?? "var(--cream)",
-              letterSpacing: "-0.02em",
-            }}>{s.value}</span>
-            {s.unit && (
+              fontWeight: 400,
+              color: "var(--sub)",
+              letterSpacing: "0.1em",
+              textTransform: "uppercase",
+            }}>{s.label}</span>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+              {s.dot && (
+                <span style={{
+                  width: 5, height: 5, borderRadius: "50%",
+                  background: s.color,
+                  display: "inline-block",
+                  marginBottom: 1,
+                  flexShrink: 0,
+                }} className={!c.paused && !c.isLoading ? "pulse" : ""} />
+              )}
               <span style={{
-                fontSize: 9,
+                fontSize: 15,
                 fontFamily: "Geist Mono",
-                color: "var(--sub)",
-                letterSpacing: "0.04em",
-              }}>{s.unit}</span>
-            )}
+                fontWeight: 500,
+                color: s.color ?? "var(--cream)",
+                letterSpacing: "-0.02em",
+              }}>{s.value}</span>
+              {s.unit && (
+                <span style={{
+                  fontSize: 9,
+                  fontFamily: "Geist Mono",
+                  color: "var(--sub)",
+                  letterSpacing: "0.04em",
+                }}>{s.unit}</span>
+              )}
+            </div>
           </div>
-        </div>
-      ))}
+        ))}
+      </div>
+
+      {/* Fast-refreshing market ticker — cosmetic only, updates every 15s
+          independent of the on-chain rate above. Confirms live wiring is working. */}
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "8px 4px",
+        fontSize: 10,
+        fontFamily: "Geist Mono",
+        color: "var(--sub)",
+      }}>
+        <span style={{
+          width: 5, height: 5, borderRadius: "50%",
+          background: live.error ? "#E05252" : live.stale ? "#E0A552" : "#5CB87A",
+          display: "inline-block",
+          flexShrink: 0,
+        }} />
+        {live.error ? (
+          <span>Live market price unavailable</span>
+        ) : live.loading ? (
+          <span>Loading live market price…</span>
+        ) : (
+          <span>
+            Live market: ${live.rbtcUsd?.toLocaleString()} BTC/USD · ${live.rifUsd?.toFixed(4)} RIF/USD
+            {live.stale && " (stale)"}
+            {live.updatedAt && ` · updated ${Math.round((Date.now() - live.updatedAt) / 1000)}s ago`}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

@@ -12,13 +12,23 @@ export const RBTC_GAS_STATION_ABI = [
           "type": "address"
         },
         {
+          "internalType": "address",
+          "name": "_usdrifPriceFeed",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_rifPriceFeed",
+          "type": "address"
+        },
+        {
           "internalType": "uint256",
-          "name": "_usdrifPerRBTC",
+          "name": "_manualUsdrifPerRBTC",
           "type": "uint256"
         },
         {
           "internalType": "uint256",
-          "name": "_rifPerRBTC",
+          "name": "_manualRifPerRBTC",
           "type": "uint256"
         },
         {
@@ -41,6 +51,36 @@ export const RBTC_GAS_STATION_ABI = [
       "type": "constructor"
     },
     {
+      "inputs": [],
+      "name": "ReentrancyGuardReentrantCall",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "lastRate",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "attemptedRate",
+          "type": "uint256"
+        }
+      ],
+      "name": "CircuitBreakerTripped",
+      "type": "event"
+    },
+    {
       "anonymous": false,
       "inputs": [
         {
@@ -57,6 +97,25 @@ export const RBTC_GAS_STATION_ABI = [
         }
       ],
       "name": "Funded",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "bool",
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "name": "OracleModeSet",
       "type": "event"
     },
     {
@@ -89,6 +148,44 @@ export const RBTC_GAS_STATION_ABI = [
         }
       ],
       "name": "PausedSet",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "feed",
+          "type": "address"
+        }
+      ],
+      "name": "PriceFeedUpdated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "newBaselineRate",
+          "type": "uint256"
+        }
+      ],
+      "name": "RateAcknowledged",
       "type": "event"
     },
     {
@@ -167,8 +264,86 @@ export const RBTC_GAS_STATION_ABI = [
       "type": "event"
     },
     {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        }
+      ],
+      "name": "acknowledgeRate",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
       "inputs": [],
       "name": "feeBps",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "lastRifRate",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "lastUsdrifRate",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "manualRifPerRBTC",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "manualUsdrifPerRBTC",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "maxDeviationBps",
       "outputs": [
         {
           "internalType": "uint256",
@@ -299,12 +474,38 @@ export const RBTC_GAS_STATION_ABI = [
     },
     {
       "inputs": [],
+      "name": "rifOracleEnabled",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
       "name": "rifPerRBTC",
       "outputs": [
         {
           "internalType": "uint256",
           "name": "",
           "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "rifPriceFeed",
+      "outputs": [
+        {
+          "internalType": "contract IMoCBaseOracle",
+          "name": "",
+          "type": "address"
         }
       ],
       "stateMutability": "view",
@@ -357,6 +558,37 @@ export const RBTC_GAS_STATION_ABI = [
     {
       "inputs": [
         {
+          "internalType": "uint256",
+          "name": "bps",
+          "type": "uint256"
+        }
+      ],
+      "name": "setMaxDeviationBps",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "internalType": "bool",
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "name": "setOracleEnabled",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
           "internalType": "bool",
           "name": "_paused",
           "type": "bool"
@@ -370,12 +602,38 @@ export const RBTC_GAS_STATION_ABI = [
     {
       "inputs": [
         {
+          "internalType": "address",
+          "name": "feed",
+          "type": "address"
+        }
+      ],
+      "name": "setRIFPriceFeed",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
           "internalType": "uint256",
           "name": "newRate",
           "type": "uint256"
         }
       ],
       "name": "setRIFRate",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "feed",
+          "type": "address"
+        }
+      ],
+      "name": "setUSDRIFPriceFeed",
       "outputs": [],
       "stateMutability": "nonpayable",
       "type": "function"
@@ -463,12 +721,38 @@ export const RBTC_GAS_STATION_ABI = [
     },
     {
       "inputs": [],
+      "name": "usdrifOracleEnabled",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
       "name": "usdrifPerRBTC",
       "outputs": [
         {
           "internalType": "uint256",
           "name": "",
           "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "usdrifPriceFeed",
+      "outputs": [
+        {
+          "internalType": "contract IMoCBaseOracle",
+          "name": "",
+          "type": "address"
         }
       ],
       "stateMutability": "view",
