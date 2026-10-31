@@ -1,0 +1,2810 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..8e2d7db
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,32 @@
++# --- secrets (never commit .env) ---
++WALLET_PRIVATE_KEY=
++RSK_TESTNET_RPC_URL=https://public-node.testnet.rsk.co
++
++# --- deploy: tokens (required, must differ) ---
++USDRIF_ADDRESS=
++RIF_ADDRESS=
++# DEPLOY_MOCK_TOKENS=1        # local/testing only: deploys mock USDRIF and RIF
++
++# --- deploy: price sources ---
++# Leave oracle addresses empty to use the bounded manual source (testnet).
++BTC_ORACLE_ADDRESS=
++RIF_ORACLE_ADDRESS=
++USDRIF_ORACLE_ADDRESS=
++INITIAL_BTC_USD=80000          # used only when BTC_ORACLE_ADDRESS is empty
++INITIAL_RIF_USD=0.075          # used only when RIF_ORACLE_ADDRESS is empty
++MANUAL_MAX_STEP_BPS=500
++PRICE_UPDATER_ADDRESS=         # keeper wallet (hot key, step-limited)
++
++# --- deploy: station parameters (USD values are plain dollars) ---
++OWNER_ADDRESS=                 # multisig; defaults to the deployer
++GUARDIAN_ADDRESS=              # can pause only
++GAS_FEE_USD=1.25               # measure first: scripts/measureGas.ts
++MIN_SWAP_USD=5
++MAX_SWAP_USD=10
++USER_DAILY_CAP_USD=10
++DAILY_OUTFLOW_CAP_RBTC=0.002
++RESERVE_FLOOR_RBTC=0.0001
++MAX_PRICE_AGE_SEC=3600
++MAX_DEVIATION_BPS=1000
++SPREAD_BPS=50
++SEED_RBTC=0.002
+diff --git a/.gitignore b/.gitignore
+index ddb4348..aecd04a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,6 +13,7 @@ artifacts
+ ## Ucomment if you want to save deployments
+ deployments/*
+ !deployments/.gitkeep
++!deployments/*.json
+ 
+ # IDE
+ .idea
+diff --git a/Frontend/rskfuelfrontend/AGENTS.md b/Frontend/rskfuelfrontend/AGENTS.md
+deleted file mode 100644
+index 8bd0e39..0000000
+--- a/Frontend/rskfuelfrontend/AGENTS.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<!-- BEGIN:nextjs-agent-rules -->
+-# This is NOT the Next.js you know
+-
+-This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
+-<!-- END:nextjs-agent-rules -->
+diff --git a/Frontend/rskfuelfrontend/CLAUDE.md b/Frontend/rskfuelfrontend/CLAUDE.md
+deleted file mode 100644
+index 43c994c..0000000
+--- a/Frontend/rskfuelfrontend/CLAUDE.md
++++ /dev/null
+@@ -1 +0,0 @@
+-@AGENTS.md
+diff --git a/contracts/MockERC20.sol b/contracts/MockERC20.sol
+index 5056dc1..48405f9 100644
+--- a/contracts/MockERC20.sol
++++ b/contracts/MockERC20.sol
+@@ -3,9 +3,17 @@ pragma solidity ^0.8.20;
+ 
+ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+ 
+-/// @dev Only used in tests — do NOT deploy to mainnet/testnet.
++/// @dev Only used in tests and on testnet: do NOT deploy to mainnet.
+ contract MockERC20 is ERC20 {
+-    constructor(string memory name, string memory symbol) ERC20(name, symbol) {}
++    uint8 private immutable _dec;
++
++    constructor(string memory name, string memory symbol, uint8 decimals_) ERC20(name, symbol) {
++        _dec = decimals_;
++    }
++
++    function decimals() public view override returns (uint8) {
++        return _dec;
++    }
+ 
+     function mint(address to, uint256 amount) external {
+         _mint(to, amount);
+diff --git a/contracts/RBTCGasStation.sol b/contracts/RBTCGasStation.sol
+index 6ba3897..069ee59 100644
+--- a/contracts/RBTCGasStation.sol
++++ b/contracts/RBTCGasStation.sol
+@@ -1,410 +1,422 @@
+ // SPDX-License-Identifier: MIT
+ pragma solidity ^0.8.20;
+ 
+-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+-
+-/**
+- * @title RBTCGasStation
+- * @notice Pre-funded RBTC Gas Station on Rootstock.
+- *         Users pay with USDRIF or RIF and receive RBTC instantly, priced
+- *         off a live on-chain oracle instead of an owner-set manual rate.
+- *
+- * @dev PRICE FEED CONVENTION — READ BEFORE DEPLOYING WITH REAL FUNDS:
+- *      Each price feed passed in here MUST return, via peek(), "how many
+- *      token-wei the user must pay per 1 RBTC-wei", scaled to 1e18 — the
+- *      exact same units the old manual `usdrifPerRBTC` / `rifPerRBTC`
+- *      variables used.
+- *
+- *      Most RSK oracles (e.g. Money On Chain's IMoCBaseOracle) publish a
+- *      USD/BTC price, not a token-per-RBTC price directly. So:
+- *        - For a USD-pegged token (USDRIF, if it holds ~$1), an RBTC/USD
+- *          feed's price IS approximately your usdrifPerRBTC rate.
+- *        - For a non-USD-pegged token (RIF), you will likely need a small
+- *          adapter contract that combines an RBTC/USD feed and a RIF/USD
+- *          feed into a single "RIF per RBTC" cross-rate, then implements
+- *          this same peek() interface so it can be dropped in below.
+- *      Verify the exact units/decimals of whatever real feed address you
+- *      wire in against ITS OWN docs before mainnet. A unit mismatch here
+- *      mispricess every swap with real money.
+- */
+-
+-interface IERC20 {
+-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+-    function transfer(address recipient, uint256 amount) external returns (bool);
+-    function balanceOf(address account) external view returns (uint256);
+-    function decimals() external view returns (uint8);
+-}
++import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
++import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
++import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
++import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
++import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
++import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
++import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
++import {IPriceSource} from "./interfaces/IPriceSource.sol";
++
++/// @title RBTCGasStation v2
++/// @notice Swaps a small amount of a supported token for RBTC (gas money) out of a
++/// funded reserve. Prices come from IPriceSource adapters, in USD.
++/// @dev Design rules:
++///  1. ONE code path (`_check`) decides whether a swap is allowed and what it pays.
++///     `previewSwap` (UI) and `swap` (execution) both call it, so the preview and
++///     the transaction cannot disagree.
++///  2. The contract recomputes the quote at execution time; it never trusts a
++///     number supplied by the UI. The caller's `minRBTCOut` is only a floor.
++///  3. Every limit is enforced on-chain: per-swap USD size, per-address daily USD,
++///     global daily RBTC outflow, a reserve floor, price age, price deviation.
++///  4. Owner should be a multisig behind a timelock; `guardian` can only pause.
++contract RBTCGasStation is Ownable2Step, Pausable, ReentrancyGuard {
++    using SafeERC20 for IERC20;
++
++    /// @dev Numeric values are part of the UI contract; append only, never reorder.
++    enum Status {
++        OK, //                 0
++        PAUSED, //             1
++        BREAKER_TRIPPED, //    2
++        TOKEN_NOT_ENABLED, //  3
++        PRICE_UNAVAILABLE, //  4
++        PRICE_STALE, //        5
++        PRICE_DEVIATION, //    6
++        BELOW_MIN_SWAP, //     7
++        ABOVE_MAX_SWAP, //     8
++        AMOUNT_TOO_SMALL, //   9  (fees would consume the whole amount)
++        USER_DAILY_CAP, //     10
++        GLOBAL_DAILY_CAP, //   11
++        RESERVE_FLOOR //       12
++    }
+ 
+-/// @dev Standard interface used by Money On Chain / most RSK price oracles.
+-interface IMoCBaseOracle {
+-    /// @return price Latest price, bytes32-encoded uint256, 1e18-scaled.
+-    /// @return valid False if the oracle itself considers this reading
+-    ///                stale or unreliable — callers MUST treat valid ==
+-    ///                false as "no usable price right now", never fall
+-    ///                back to it silently.
+-    function peek() external view returns (bytes32 price, bool valid);
+-}
++    struct TokenConfig {
++        IPriceSource priceSource;
++        uint8 decimals;
++        uint16 spreadBps;
++        bool enabled;
++    }
+ 
+-contract RBTCGasStation is ReentrancyGuard {
+-    // ── State ────────────────────────────────────────────────────────────────
++    struct Quote {
++        uint256 btcPriceUsd; //     1e18
++        uint256 tokenPriceUsd; //   1e18 per whole token
++        uint256 valueUsd; //        1e18
++        uint256 grossRBTC; //       wei
++        uint256 gasFeeRBTC; //      wei, fixed gas-recovery fee
++        uint256 spreadRBTC; //      wei, percentage fee
++        uint256 netRBTC; //         wei the user receives
++        uint256 tokensPerRBTC; //   token base units per 1 RBTC (display rate)
++        uint256 oldestPriceAt; //   timestamp of the oldest price used
++    }
+ 
+-    address public owner;
++    struct Params {
++        address btcPriceSource;
++        uint256 gasRecoveryFeeUsd;
++        uint256 minSwapUsd;
++        uint256 maxSwapUsd;
++        uint256 userDailyCapUsd;
++        uint256 dailyOutflowCapWei;
++        uint256 reserveFloorWei;
++        uint256 maxPriceAge;
++        uint256 maxDeviationBps;
++    }
+ 
+-    address public usdrifToken;
+-    address public rifToken;
++    struct UserDay {
++        uint64 day;
++        uint192 spentUsd;
++    }
+ 
+-    /// @notice Live oracle feeds. address(0) means "no oracle wired up for this token".
+-    IMoCBaseOracle public usdrifPriceFeed;
+-    IMoCBaseOracle public rifPriceFeed;
++    uint256 private constant WAD = 1e18;
++    uint256 private constant BPS = 10_000;
++    uint16 public constant MAX_SPREAD_BPS = 1_000; // 10%
++
++    IPriceSource public btcPriceSource;
++    mapping(address => TokenConfig) public tokens;
++    address[] private _tokenList;
++    address public guardian;
++
++    uint256 public gasRecoveryFeeUsd;
++    uint256 public minSwapUsd;
++    uint256 public maxSwapUsd;
++    uint256 public userDailyCapUsd;
++    uint256 public dailyOutflowCapWei;
++    uint256 public reserveFloorWei;
++    uint256 public maxPriceAge;
++    uint256 public maxDeviationBps;
++
++    uint256 public baselineBtcPriceUsd;
++    bool public breakerTripped;
++
++    mapping(address => UserDay) public userDay;
++    uint64 public outflowDay;
++    uint192 public outflowToday;
++
++    error Expired();
++    error SwapNotAllowed(Status status);
++    error Slippage(uint256 got, uint256 minimum);
++    error UnexpectedTokenBalance();
++    error RBTCTransferFailed();
++
++    event Swapped(
++        address indexed user,
++        address indexed token,
++        uint256 tokenAmountIn,
++        uint256 netRBTC,
++        uint256 gasFeeRBTC,
++        uint256 spreadRBTC,
++        uint256 btcPriceUsd,
++        uint256 tokenPriceUsd
++    );
++    event TokenConfigured(address indexed token, address priceSource, uint8 decimals, uint16 spreadBps, bool enabled);
++    event BtcPriceSourceSet(address indexed source);
++    event GasRecoveryFeeSet(uint256 feeUsd);
++    event LimitsSet(uint256 minSwapUsd, uint256 maxSwapUsd, uint256 userDailyCapUsd, uint256 dailyOutflowCapWei, uint256 reserveFloorWei);
++    event PriceGuardsSet(uint256 maxPriceAge, uint256 maxDeviationBps);
++    event GuardianSet(address indexed guardian);
++    event Checkpoint(uint256 btcPriceUsd);
++    event BreakerTripped(uint256 baselineBtcPriceUsd, uint256 observedBtcPriceUsd);
++    event BreakerReset(uint256 baselineBtcPriceUsd);
++    event Funded(address indexed funder, uint256 amount);
++    event Withdrawn(address indexed token, address indexed to, uint256 amount);
+ 
+-    /// @notice Emergency manual fallback rate — only used while that token's
+-    /// oracle mode is switched off. Same units as before: token-wei per 1 RBTC-wei.
+-    uint256 public manualUsdrifPerRBTC;
+-    uint256 public manualRifPerRBTC;
++    constructor(address owner_, Params memory p) Ownable(owner_) {
++        _setBtcPriceSource(p.btcPriceSource);
++        _setGasRecoveryFee(p.gasRecoveryFeeUsd);
++        _setLimits(p.minSwapUsd, p.maxSwapUsd, p.userDailyCapUsd, p.dailyOutflowCapWei, p.reserveFloorWei);
++        _setPriceGuards(p.maxPriceAge, p.maxDeviationBps);
++    }
+ 
+-    bool public usdrifOracleEnabled;
+-    bool public rifOracleEnabled;
++    receive() external payable {
++        emit Funded(msg.sender, msg.value);
++    }
+ 
+-    /// @notice Circuit breaker: max allowed move (in bps) between the last
+-    /// rate this contract actually used and a fresh oracle reading, before
+-    /// swaps for that token pause and wait for owner review.
+-    uint256 public maxDeviationBps = 1000; // 10% default — tune before mainnet
++    // ---------------------------------------------------------------------
++    // Swap
++    // ---------------------------------------------------------------------
+ 
+-    /// @notice Last rate actually used to price a swap, per token (circuit
+-    /// breaker baseline).
+-    uint256 public lastUsdrifRate;
+-    uint256 public lastRifRate;
++    /// @notice Swap `amountIn` of `token` for RBTC, sent to msg.sender.
++    /// @param minRBTCOut Revert if the contract's own quote pays less than this (wei).
++    /// @param deadline Revert if block.timestamp is later than this.
++    function swap(address token, uint256 amountIn, uint256 minRBTCOut, uint256 deadline) external nonReentrant {
++        if (block.timestamp > deadline) revert Expired();
+ 
+-    uint256 public feeBps;
+-    uint256 public minRBTCOut;
+-    uint256 public maxRBTCOut;
++        (Quote memory q, Status s) = _check(token, amountIn, msg.sender);
++        if (s != Status.OK) revert SwapNotAllowed(s);
++        if (q.netRBTC < minRBTCOut) revert Slippage(q.netRBTC, minRBTCOut);
+ 
+-    bool public paused;
++        _recordUsage(msg.sender, q);
++        _pull(token, amountIn);
+ 
+-    /// @notice A separate, lower-privilege address allowed to push rate
+-    /// updates (e.g. an automated price-keeper bot). Deliberately CANNOT
+-    /// withdraw funds, change fees, or do anything owner can — limits the
+-    /// blast radius of a key that has to live on an always-running server.
+-    address public priceUpdater;
++        (bool ok, ) = payable(msg.sender).call{value: q.netRBTC}("");
++        if (!ok) revert RBTCTransferFailed();
+ 
+-    // ── Events ───────────────────────────────────────────────────────────────
++        emit Swapped(msg.sender, token, amountIn, q.netRBTC, q.gasFeeRBTC, q.spreadRBTC, q.btcPriceUsd, q.tokenPriceUsd);
++    }
+ 
+-    event Swapped(address indexed user, address indexed tokenIn, uint256 tokenAmountIn, uint256 rbtcAmountOut, uint256 feeRBTC);
+-    event RateUpdated(address indexed token, uint256 newRate);
+-    event PriceFeedUpdated(address indexed token, address feed);
+-    event OracleModeSet(address indexed token, bool enabled);
+-    event CircuitBreakerTripped(address indexed token, uint256 lastRate, uint256 attemptedRate);
+-    event RateAcknowledged(address indexed token, uint256 newBaselineRate);
+-    event Funded(address indexed funder, uint256 amount);
+-    event Withdrawn(address indexed token, uint256 amount);
+-    event PausedSet(bool paused);
+-    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+-    event PriceUpdaterChanged(address indexed oldUpdater, address indexed newUpdater);
+-
+-    // ── Modifiers ────────────────────────────────────────────────────────────
+-
+-    modifier onlyOwner() {
+-        require(msg.sender == owner, "GasStation: not owner");
+-        _;
+-    }
+-
+-    modifier whenNotPaused() {
+-        require(!paused, "GasStation: paused");
+-        _;
+-    }
+-
+-    modifier onlyOwnerOrUpdater() {
+-        require(msg.sender == owner || msg.sender == priceUpdater, "GasStation: not authorized");
+-        _;
+-    }
+-
+-    // ── Constructor ──────────────────────────────────────────────────────────
+-
+-    /**
+-     * @param _usdrifToken        USDRIF token contract address
+-     * @param _rifToken           RIF token contract address
+-     * @param _usdrifPriceFeed    IMoCBaseOracle-compatible feed for USDRIF, or address(0) to start in manual mode
+-     * @param _rifPriceFeed       IMoCBaseOracle-compatible feed for RIF, or address(0) to start in manual mode
+-     * @param _manualUsdrifPerRBTC  Fallback rate used only if oracle is off/unset
+-     * @param _manualRifPerRBTC     Fallback rate used only if oracle is off/unset
+-     * @param _feeBps             Swap fee in basis points (e.g. 50 = 0.5%)
+-     * @param _minRBTCOut         Minimum RBTC out per swap (wei)
+-     * @param _maxRBTCOut         Maximum RBTC out per swap (wei)
+-     */
+-    constructor(
+-        address _usdrifToken,
+-        address _rifToken,
+-        address _usdrifPriceFeed,
+-        address _rifPriceFeed,
+-        uint256 _manualUsdrifPerRBTC,
+-        uint256 _manualRifPerRBTC,
+-        uint256 _feeBps,
+-        uint256 _minRBTCOut,
+-        uint256 _maxRBTCOut
+-    ) {
+-        require(_usdrifToken != address(0), "GasStation: zero usdrif addr");
+-        require(_rifToken != address(0), "GasStation: zero rif addr");
+-        require(_feeBps < 10_000, "GasStation: fee >= 100%");
+-        require(_minRBTCOut <= _maxRBTCOut, "GasStation: min > max");
+-
+-        owner = msg.sender;
+-        usdrifToken = _usdrifToken;
+-        rifToken = _rifToken;
+-
+-        if (_usdrifPriceFeed != address(0)) {
+-            usdrifPriceFeed = IMoCBaseOracle(_usdrifPriceFeed);
+-            usdrifOracleEnabled = true;
+-        }
+-        if (_rifPriceFeed != address(0)) {
+-            rifPriceFeed = IMoCBaseOracle(_rifPriceFeed);
+-            rifOracleEnabled = true;
+-        }
++    /// @notice Exactly what `swap` would do for `user` right now (same code path).
++    /// If `status` is not OK the swap would revert with SwapNotAllowed(status).
++    function previewSwap(address token, uint256 amountIn, address user) external view returns (Quote memory q, Status status) {
++        return _check(token, amountIn, user);
++    }
+ 
+-        manualUsdrifPerRBTC = _manualUsdrifPerRBTC;
+-        manualRifPerRBTC = _manualRifPerRBTC;
+-        lastUsdrifRate = _manualUsdrifPerRBTC;
+-        lastRifRate = _manualRifPerRBTC;
++    /// @notice What `user` can still do today, for the UI.
++    function remainingAllowance(address user)
++        external
++        view
++        returns (uint256 userUsdLeft, uint256 globalWeiLeft, uint256 spendableReserveWei)
++    {
++        uint256 today = block.timestamp / 1 days;
++        UserDay memory u = userDay[user];
++        uint256 spent = u.day == today ? u.spentUsd : 0;
++        userUsdLeft = spent >= userDailyCapUsd ? 0 : userDailyCapUsd - spent;
++
++        uint256 out = outflowDay == today ? outflowToday : 0;
++        globalWeiLeft = out >= dailyOutflowCapWei ? 0 : dailyOutflowCapWei - out;
+ 
+-        feeBps = _feeBps;
+-        minRBTCOut = _minRBTCOut;
+-        maxRBTCOut = _maxRBTCOut;
++        uint256 bal = address(this).balance;
++        spendableReserveWei = bal > reserveFloorWei ? bal - reserveFloorWei : 0;
+     }
+ 
+-    // ── Funding ──────────────────────────────────────────────────────────────
++    function tokenCount() external view returns (uint256) {
++        return _tokenList.length;
++    }
+ 
+-    receive() external payable {
+-        emit Funded(msg.sender, msg.value);
++    function tokenAt(uint256 index) external view returns (address) {
++        return _tokenList[index];
+     }
+ 
+-    // ── Core Swap ────────────────────────────────────────────────────────────
++    // ---------------------------------------------------------------------
++    // The single decision path
++    // ---------------------------------------------------------------------
+ 
+-    function swapUSDRIFForRBTC(uint256 tokenAmountIn, uint256 minRBTCExpected)
+-        external
+-        whenNotPaused
+-        nonReentrant
+-    {
+-        uint256 rate = _resolveRate(usdrifPriceFeed, usdrifOracleEnabled, manualUsdrifPerRBTC, lastUsdrifRate, usdrifToken);
+-        lastUsdrifRate = rate;
+-        _swap(usdrifToken, rate, tokenAmountIn, minRBTCExpected);
++    function _check(address token, uint256 amountIn, address user) internal view returns (Quote memory q, Status s) {
++        if (paused()) return (q, Status.PAUSED);
++        if (breakerTripped) return (q, Status.BREAKER_TRIPPED);
++
++        (q, s) = _buildQuote(token, amountIn);
++        if (s != Status.OK) return (q, s);
++
++        s = _checkLimits(q, user);
+     }
+ 
+-    function swapRIFForRBTC(uint256 tokenAmountIn, uint256 minRBTCExpected)
+-        external
+-        whenNotPaused
+-        nonReentrant
+-    {
+-        uint256 rate = _resolveRate(rifPriceFeed, rifOracleEnabled, manualRifPerRBTC, lastRifRate, rifToken);
+-        lastRifRate = rate;
+-        _swap(rifToken, rate, tokenAmountIn, minRBTCExpected);
+-    }
+-
+-    // ── Oracle resolution + circuit breaker ─────────────────────────────────
+-
+-    /// @dev Resolves the current rate for a token, either from its oracle
+-    /// (with staleness + deviation checks) or the manual fallback if oracle
+-    /// mode is off. Reverts rather than ever silently swapping at a bad price.
+-    function _resolveRate(
+-        IMoCBaseOracle feed,
+-        bool oracleEnabled,
+-        uint256 manualRate,
+-        uint256 lastAcceptedRate,
+-        address tokenForEvent
+-    ) internal returns (uint256) {
+-        if (!oracleEnabled) {
+-            require(manualRate > 0, "GasStation: manual rate not set");
+-            return manualRate;
++    function _buildQuote(address token, uint256 amountIn) internal view returns (Quote memory q, Status s) {
++        TokenConfig memory t = tokens[token];
++        if (!t.enabled) return (q, Status.TOKEN_NOT_ENABLED);
++
++        uint256 btcAt;
++        uint256 tokAt;
++        try btcPriceSource.getPrice() returns (uint256 p, uint256 at) {
++            q.btcPriceUsd = p;
++            btcAt = at;
++        } catch {
++            return (q, Status.PRICE_UNAVAILABLE);
+         }
++        try t.priceSource.getPrice() returns (uint256 p, uint256 at) {
++            q.tokenPriceUsd = p;
++            tokAt = at;
++        } catch {
++            return (q, Status.PRICE_UNAVAILABLE);
++        }
++        if (q.btcPriceUsd == 0 || q.tokenPriceUsd == 0) return (q, Status.PRICE_UNAVAILABLE);
+ 
+-        (bytes32 rawPrice, bool valid) = feed.peek();
+-        require(valid, "GasStation: oracle price stale/invalid");
+-
+-        uint256 rate = uint256(rawPrice);
+-        require(rate > 0, "GasStation: zero oracle rate");
++        q.oldestPriceAt = btcAt < tokAt ? btcAt : tokAt;
++        if (block.timestamp > q.oldestPriceAt + maxPriceAge) return (q, Status.PRICE_STALE);
+ 
+-        if (lastAcceptedRate > 0) {
+-            uint256 diff = rate > lastAcceptedRate ? rate - lastAcceptedRate : lastAcceptedRate - rate;
+-            uint256 deviationBps = (diff * 10_000) / lastAcceptedRate;
+-            if (deviationBps > maxDeviationBps) {
+-                emit CircuitBreakerTripped(tokenForEvent, lastAcceptedRate, rate);
+-                revert("GasStation: rate moved too much, needs owner review");
+-            }
++        if (baselineBtcPriceUsd != 0 && _deviationBps(baselineBtcPriceUsd, q.btcPriceUsd) > maxDeviationBps) {
++            return (q, Status.PRICE_DEVIATION);
+         }
+ 
+-        return rate;
+-    }
+-
+-    // ── Internal swap math (unchanged from the original) ────────────────────
++        uint256 unit = 10 ** uint256(t.decimals);
++        q.valueUsd = (amountIn * q.tokenPriceUsd) / unit;
++        if (q.valueUsd < minSwapUsd) return (q, Status.BELOW_MIN_SWAP);
++        if (q.valueUsd > maxSwapUsd) return (q, Status.ABOVE_MAX_SWAP);
+ 
+-    function _swap(address token, uint256 rateTokenPerRBTC, uint256 tokenAmountIn, uint256 minRBTCExpected) internal {
+-        require(tokenAmountIn > 0, "GasStation: zero input");
+-        require(rateTokenPerRBTC > 0, "GasStation: rate not set");
++        q.grossRBTC = (q.valueUsd * WAD) / q.btcPriceUsd;
++        q.gasFeeRBTC = (gasRecoveryFeeUsd * WAD) / q.btcPriceUsd;
++        q.spreadRBTC = (q.grossRBTC * t.spreadBps) / BPS;
++        uint256 fees = q.gasFeeRBTC + q.spreadRBTC;
++        if (q.grossRBTC <= fees) return (q, Status.AMOUNT_TOO_SMALL);
+ 
+-        uint256 rbtcGross = (tokenAmountIn * 1 ether) / rateTokenPerRBTC;
+-        uint256 feeRBTC = (rbtcGross * feeBps) / 10_000;
+-        uint256 rbtcOut = rbtcGross - feeRBTC;
++        q.netRBTC = q.grossRBTC - fees;
++        q.tokensPerRBTC = (q.btcPriceUsd * unit) / q.tokenPriceUsd;
++        return (q, Status.OK);
++    }
+ 
+-        require(rbtcOut >= minRBTCOut, "GasStation: below min output");
+-        require(rbtcOut <= maxRBTCOut, "GasStation: above max output");
+-        require(rbtcOut >= minRBTCExpected, "GasStation: slippage exceeded");
+-        require(address(this).balance >= rbtcOut, "GasStation: insufficient RBTC reserve");
++    function _checkLimits(Quote memory q, address user) internal view returns (Status) {
++        uint256 today = block.timestamp / 1 days;
+ 
+-        bool ok = IERC20(token).transferFrom(msg.sender, address(this), tokenAmountIn);
+-        require(ok, "GasStation: token transfer failed");
++        UserDay memory u = userDay[user];
++        uint256 spent = u.day == today ? u.spentUsd : 0;
++        if (spent + q.valueUsd > userDailyCapUsd) return Status.USER_DAILY_CAP;
+ 
+-        (bool sent, ) = payable(msg.sender).call{value: rbtcOut}("");
+-        require(sent, "GasStation: RBTC send failed");
++        uint256 out = outflowDay == today ? outflowToday : 0;
++        if (out + q.netRBTC > dailyOutflowCapWei) return Status.GLOBAL_DAILY_CAP;
+ 
+-        emit Swapped(msg.sender, token, tokenAmountIn, rbtcOut, feeRBTC);
++        if (address(this).balance < q.netRBTC + reserveFloorWei) return Status.RESERVE_FLOOR;
++        return Status.OK;
+     }
+ 
+-    // ── View helpers (SAME names/signatures the frontend already calls) ────
++    function _recordUsage(address user, Quote memory q) internal {
++        uint64 today = uint64(block.timestamp / 1 days);
+ 
+-    /// @notice Effective current rate for USDRIF — oracle-derived if enabled.
+-    /// Same external signature as the old public state variable, so the
+-    /// existing frontend code needs zero changes to keep reading this.
+-    function usdrifPerRBTC() external view returns (uint256) {
+-        return usdrifOracleEnabled ? _peekOnly(usdrifPriceFeed) : manualUsdrifPerRBTC;
+-    }
++        UserDay storage u = userDay[user];
++        uint256 spent = u.day == today ? u.spentUsd : 0;
++        u.day = today;
++        u.spentUsd = uint192(spent + q.valueUsd);
+ 
+-    /// @notice Effective current rate for RIF — oracle-derived if enabled.
+-    function rifPerRBTC() external view returns (uint256) {
+-        return rifOracleEnabled ? _peekOnly(rifPriceFeed) : manualRifPerRBTC;
+-    }
++        uint256 out = outflowDay == today ? outflowToday : 0;
++        outflowDay = today;
++        outflowToday = uint192(out + q.netRBTC);
+ 
+-    function _peekOnly(IMoCBaseOracle feed) internal view returns (uint256) {
+-        (bytes32 rawPrice, bool valid) = feed.peek();
+-        require(valid, "GasStation: oracle price stale/invalid");
+-        return uint256(rawPrice);
++        if (baselineBtcPriceUsd != q.btcPriceUsd) baselineBtcPriceUsd = q.btcPriceUsd;
+     }
+ 
+-    function quoteRBTCOut(address token, uint256 tokenAmountIn) external view returns (uint256 rbtcOut, uint256 feeRBTC) {
+-        uint256 rate = _rateFor(token);
+-        require(rate > 0, "GasStation: unsupported token");
+-        uint256 gross = (tokenAmountIn * 1 ether) / rate;
+-        feeRBTC = (gross * feeBps) / 10_000;
+-        rbtcOut = gross - feeRBTC;
++    function _pull(address token, uint256 amountIn) internal {
++        IERC20 erc = IERC20(token);
++        uint256 before = erc.balanceOf(address(this));
++        erc.safeTransferFrom(msg.sender, address(this), amountIn);
++        if (erc.balanceOf(address(this)) - before != amountIn) revert UnexpectedTokenBalance();
+     }
+ 
+-    function quoteTokenIn(address token, uint256 rbtcWanted) external view returns (uint256 tokenIn) {
+-        uint256 rate = _rateFor(token);
+-        require(rate > 0, "GasStation: unsupported token");
+-        uint256 grossRBTC = (rbtcWanted * 10_000) / (10_000 - feeBps);
+-        tokenIn = (grossRBTC * rate) / 1 ether;
++    function _deviationBps(uint256 base, uint256 current) internal pure returns (uint256) {
++        uint256 diff = current > base ? current - base : base - current;
++        return (diff * BPS) / base;
+     }
+ 
+-    function _rateFor(address token) internal view returns (uint256) {
+-        if (token == usdrifToken) return usdrifOracleEnabled ? _peekOnly(usdrifPriceFeed) : manualUsdrifPerRBTC;
+-        if (token == rifToken) return rifOracleEnabled ? _peekOnly(rifPriceFeed) : manualRifPerRBTC;
+-        return 0;
++    // ---------------------------------------------------------------------
++    // Circuit breaker (event persists because nothing reverts here)
++    // ---------------------------------------------------------------------
++
++    /// @notice Anyone (a monitor bot) can call this. If the BTC price moved more than
++    /// maxDeviationBps from the last accepted price, the breaker trips and swaps stop
++    /// until the owner calls resetBreaker(). Otherwise the baseline moves forward.
++    function checkpointPrices() external {
++        if (breakerTripped) return;
++        (uint256 p, ) = btcPriceSource.getPrice();
++        if (p == 0) return;
++        if (baselineBtcPriceUsd != 0 && _deviationBps(baselineBtcPriceUsd, p) > maxDeviationBps) {
++            breakerTripped = true;
++            emit BreakerTripped(baselineBtcPriceUsd, p);
++            return;
++        }
++        baselineBtcPriceUsd = p;
++        emit Checkpoint(p);
+     }
+ 
+-    function rbtcReserve() external view returns (uint256) {
+-        return address(this).balance;
++    /// @notice Owner confirms the new price is real and re-opens swaps.
++    function resetBreaker() external onlyOwner {
++        (uint256 p, ) = btcPriceSource.getPrice();
++        require(p > 0, "GasStation: zero price");
++        baselineBtcPriceUsd = p;
++        breakerTripped = false;
++        emit BreakerReset(p);
+     }
+ 
+-    function tokenBalance(address token) external view returns (uint256) {
+-        return IERC20(token).balanceOf(address(this));
+-    }
++    // ---------------------------------------------------------------------
++    // Admin (owner = multisig behind a timelock)
++    // ---------------------------------------------------------------------
+ 
+-    // ── Owner Admin ──────────────────────────────────────────────────────────
++    function setToken(address token, address priceSource, uint16 spreadBps, bool enabled) external onlyOwner {
++        require(token != address(0), "GasStation: zero token");
++        require(priceSource.code.length > 0, "GasStation: source not a contract");
++        require(spreadBps <= MAX_SPREAD_BPS, "GasStation: spread too high");
++        uint8 dec = IERC20Metadata(token).decimals();
++        require(dec <= 36, "GasStation: decimals too high");
+ 
+-    function setUSDRIFPriceFeed(address feed) external onlyOwner {
+-        usdrifPriceFeed = IMoCBaseOracle(feed);
+-        emit PriceFeedUpdated(usdrifToken, feed);
++        if (address(tokens[token].priceSource) == address(0)) _tokenList.push(token);
++        tokens[token] = TokenConfig(IPriceSource(priceSource), dec, spreadBps, enabled);
++        emit TokenConfigured(token, priceSource, dec, spreadBps, enabled);
+     }
+ 
+-    function setRIFPriceFeed(address feed) external onlyOwner {
+-        rifPriceFeed = IMoCBaseOracle(feed);
+-        emit PriceFeedUpdated(rifToken, feed);
++    function setBtcPriceSource(address source) external onlyOwner {
++        _setBtcPriceSource(source);
+     }
+ 
+-    /// @notice Toggle oracle mode per token. Turning it off falls back to
+-    /// the manual rate — use only as an emergency measure, and re-check
+-    /// `manualUsdrifPerRBTC`/`manualRifPerRBTC` are fresh before doing so.
+-    function setOracleEnabled(address token, bool enabled) external onlyOwner {
+-        if (token == usdrifToken) {
+-            usdrifOracleEnabled = enabled;
+-        } else if (token == rifToken) {
+-            rifOracleEnabled = enabled;
+-        } else {
+-            revert("GasStation: unsupported token");
+-        }
+-        emit OracleModeSet(token, enabled);
++    function setGasRecoveryFee(uint256 feeUsd) external onlyOwner {
++        _setGasRecoveryFee(feeUsd);
+     }
+ 
+-    /// @notice Emergency/keeper-driven manual rate — only takes effect while
+-    /// that token's oracle mode is off. Callable by owner OR the priceUpdater
+-    /// bot, so an automated keeper key never needs owner-level privileges.
+-    function setUSDRIFRate(uint256 newRate) external onlyOwnerOrUpdater {
+-        require(newRate > 0, "GasStation: zero rate");
+-        manualUsdrifPerRBTC = newRate;
+-        emit RateUpdated(usdrifToken, newRate);
++    function setLimits(
++        uint256 minSwapUsd_,
++        uint256 maxSwapUsd_,
++        uint256 userDailyCapUsd_,
++        uint256 dailyOutflowCapWei_,
++        uint256 reserveFloorWei_
++    ) external onlyOwner {
++        _setLimits(minSwapUsd_, maxSwapUsd_, userDailyCapUsd_, dailyOutflowCapWei_, reserveFloorWei_);
+     }
+ 
+-    function setRIFRate(uint256 newRate) external onlyOwnerOrUpdater {
+-        require(newRate > 0, "GasStation: zero rate");
+-        manualRifPerRBTC = newRate;
+-        emit RateUpdated(rifToken, newRate);
++    function setPriceGuards(uint256 maxPriceAge_, uint256 maxDeviationBps_) external onlyOwner {
++        _setPriceGuards(maxPriceAge_, maxDeviationBps_);
+     }
+ 
+-    /// @notice Set (or revoke, with address(0)) the automated price-keeper address.
+-    function setPriceUpdater(address _updater) external onlyOwner {
+-        emit PriceUpdaterChanged(priceUpdater, _updater);
+-        priceUpdater = _updater;
++    function setGuardian(address guardian_) external onlyOwner {
++        guardian = guardian_;
++        emit GuardianSet(guardian_);
+     }
+ 
+-    function setMaxDeviationBps(uint256 bps) external onlyOwner {
+-        require(bps > 0 && bps <= 10_000, "GasStation: invalid bps");
+-        maxDeviationBps = bps;
++    /// @notice Owner or guardian can pause. Only the owner can unpause.
++    function pause() external {
++        require(msg.sender == owner() || msg.sender == guardian, "GasStation: not authorized");
++        _pause();
+     }
+ 
+-    /// @notice After a CircuitBreakerTripped event, the owner reviews the
+-    /// move off-chain and calls this to accept the oracle's current price
+-    /// as the new baseline, unblocking swaps for that token again.
+-    function acknowledgeRate(address token) external onlyOwner {
+-        if (token == usdrifToken) {
+-            lastUsdrifRate = _peekOnly(usdrifPriceFeed);
+-            emit RateAcknowledged(token, lastUsdrifRate);
+-        } else if (token == rifToken) {
+-            lastRifRate = _peekOnly(rifPriceFeed);
+-            emit RateAcknowledged(token, lastRifRate);
+-        } else {
+-            revert("GasStation: unsupported token");
+-        }
++    function unpause() external onlyOwner {
++        _unpause();
+     }
+ 
+-    function setFeeBps(uint256 _feeBps) external onlyOwner {
+-        require(_feeBps < 10_000, "GasStation: fee >= 100%");
+-        feeBps = _feeBps;
++    function withdrawTokens(address token, uint256 amount) external onlyOwner nonReentrant {
++        IERC20(token).safeTransfer(owner(), amount);
++        emit Withdrawn(token, owner(), amount);
+     }
+ 
+-    function setLimits(uint256 _minRBTCOut, uint256 _maxRBTCOut) external onlyOwner {
+-        require(_minRBTCOut <= _maxRBTCOut, "GasStation: min > max");
+-        minRBTCOut = _minRBTCOut;
+-        maxRBTCOut = _maxRBTCOut;
++    function withdrawRBTC(uint256 amount) external onlyOwner nonReentrant {
++        require(address(this).balance >= amount, "GasStation: insufficient balance");
++        (bool ok, ) = payable(owner()).call{value: amount}("");
++        require(ok, "GasStation: RBTC withdraw failed");
++        emit Withdrawn(address(0), owner(), amount);
+     }
+ 
+-    function setPaused(bool _paused) external onlyOwner {
+-        paused = _paused;
+-        emit PausedSet(_paused);
++    function _setBtcPriceSource(address source) internal {
++        require(source.code.length > 0, "GasStation: source not a contract");
++        btcPriceSource = IPriceSource(source);
++        emit BtcPriceSourceSet(source);
+     }
+ 
+-    function withdrawTokens(address token, uint256 amount) external onlyOwner nonReentrant {
+-        bool ok = IERC20(token).transfer(owner, amount);
+-        require(ok, "GasStation: withdraw failed");
+-        emit Withdrawn(token, amount);
++    function _setGasRecoveryFee(uint256 feeUsd) internal {
++        gasRecoveryFeeUsd = feeUsd;
++        emit GasRecoveryFeeSet(feeUsd);
+     }
+ 
+-    function withdrawRBTC(uint256 amount) external onlyOwner nonReentrant {
+-        require(address(this).balance >= amount, "GasStation: insufficient balance");
+-        (bool sent, ) = payable(owner).call{value: amount}("");
+-        require(sent, "GasStation: RBTC withdraw failed");
+-        emit Withdrawn(address(0), amount);
++    function _setLimits(uint256 minUsd, uint256 maxUsd, uint256 userDaily, uint256 outflowCap, uint256 floor_) internal {
++        require(minUsd > 0 && minUsd <= maxUsd, "GasStation: bad swap range");
++        require(userDaily >= maxUsd, "GasStation: user cap < max swap");
++        require(outflowCap > 0, "GasStation: zero outflow cap");
++        minSwapUsd = minUsd;
++        maxSwapUsd = maxUsd;
++        userDailyCapUsd = userDaily;
++        dailyOutflowCapWei = outflowCap;
++        reserveFloorWei = floor_;
++        emit LimitsSet(minUsd, maxUsd, userDaily, outflowCap, floor_);
+     }
+ 
+-    function transferOwnership(address newOwner) external onlyOwner {
+-        require(newOwner != address(0), "GasStation: zero address");
+-        emit OwnershipTransferred(owner, newOwner);
+-        owner = newOwner;
++    function _setPriceGuards(uint256 maxAge, uint256 maxDevBps) internal {
++        require(maxAge > 0, "GasStation: zero max age");
++        require(maxDevBps > 0 && maxDevBps <= BPS, "GasStation: bad deviation");
++        maxPriceAge = maxAge;
++        maxDeviationBps = maxDevBps;
++        emit PriceGuardsSet(maxAge, maxDevBps);
+     }
+ }
+diff --git a/contracts/interfaces/IMoCBaseOracle.sol b/contracts/interfaces/IMoCBaseOracle.sol
+new file mode 100644
+index 0000000..fc8e68b
+--- /dev/null
++++ b/contracts/interfaces/IMoCBaseOracle.sol
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/// @notice Money On Chain style oracle read surface.
++/// ASSUMPTION (verify with scripts/inspectOnchain.ts before using): `peek()`
++/// returns the USD price scaled by 1e18 and a validity flag.
++interface IMoCBaseOracle {
++    function peek() external view returns (bytes32 price, bool valid);
++}
+diff --git a/contracts/interfaces/IPriceSource.sol b/contracts/interfaces/IPriceSource.sol
+new file mode 100644
+index 0000000..935706c
+--- /dev/null
++++ b/contracts/interfaces/IPriceSource.sol
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++/// @notice One price feed for ONE asset, always expressed in USD.
++/// The gas station only ever talks to this interface, so a new coin or a new
++/// chain is a new adapter, never a change to the swap logic.
++interface IPriceSource {
++    /// @return priceUsd USD value of ONE whole unit of the asset, scaled by 1e18
++    /// @return updatedAt Unix time the price was last updated
++    function getPrice() external view returns (uint256 priceUsd, uint256 updatedAt);
++}
+diff --git a/contracts/mocks/MockFeeToken.sol b/contracts/mocks/MockFeeToken.sol
+new file mode 100644
+index 0000000..55fde2e
+--- /dev/null
++++ b/contracts/mocks/MockFeeToken.sol
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
++
++/// @dev Test double: burns 1% of every transfer (a fee-on-transfer token).
++contract MockFeeToken is ERC20 {
++    constructor() ERC20("FeeToken", "FEE") {}
++
++    function mint(address to, uint256 amount) external {
++        _mint(to, amount);
++    }
++
++    function _update(address from, address to, uint256 value) internal override {
++        if (from != address(0) && to != address(0)) {
++            uint256 fee = value / 100;
++            super._update(from, address(0), fee);
++            super._update(from, to, value - fee);
++        } else {
++            super._update(from, to, value);
++        }
++    }
++}
+diff --git a/contracts/mocks/ReentrantReceiver.sol b/contracts/mocks/ReentrantReceiver.sol
+new file mode 100644
+index 0000000..7d5826d
+--- /dev/null
++++ b/contracts/mocks/ReentrantReceiver.sol
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
++
++interface IStation {
++    function swap(address token, uint256 amountIn, uint256 minRBTCOut, uint256 deadline) external;
++}
++
++/// @dev Test double: tries to re-enter swap() from its receive() hook.
++contract ReentrantReceiver {
++    IStation public station;
++    address public token;
++    uint256 public amount;
++    bool public reentered;
++
++    constructor(address station_, address token_) {
++        station = IStation(station_);
++        token = token_;
++    }
++
++    function attack(uint256 amount_) external {
++        amount = amount_;
++        IERC20(token).approve(address(station), type(uint256).max);
++        station.swap(token, amount_, 0, block.timestamp + 1 hours);
++    }
++
++    receive() external payable {
++        reentered = true;
++        station.swap(token, amount, 0, block.timestamp + 1 hours);
++    }
++}
+diff --git a/contracts/sources/BoundedManualPriceSource.sol b/contracts/sources/BoundedManualPriceSource.sol
+new file mode 100644
+index 0000000..3d8ff1f
+--- /dev/null
++++ b/contracts/sources/BoundedManualPriceSource.sol
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
++import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
++import {IPriceSource} from "../interfaces/IPriceSource.sol";
++
++/// @notice Timestamped, step-limited manual price for testnet or for assets
++/// with no on-chain feed yet. The `updater` (a hot keeper key) can only move
++/// the price by `maxStepBps` per update, so a stolen updater key cannot set
++/// an arbitrary price. The owner (multisig) is not step-limited.
++contract BoundedManualPriceSource is IPriceSource, Ownable2Step {
++    uint256 public price;
++    uint256 public updatedAt;
++    uint256 public maxStepBps;
++    address public updater;
++
++    event PriceSet(uint256 oldPrice, uint256 newPrice, address indexed by);
++    event UpdaterSet(address indexed updater);
++    event MaxStepSet(uint256 bps);
++
++    constructor(address owner_, uint256 initialPrice, uint256 maxStepBps_) Ownable(owner_) {
++        require(initialPrice > 0, "ManualSource: zero price");
++        require(maxStepBps_ > 0 && maxStepBps_ <= 10_000, "ManualSource: bad step");
++        price = initialPrice;
++        updatedAt = block.timestamp;
++        maxStepBps = maxStepBps_;
++    }
++
++    function getPrice() external view returns (uint256, uint256) {
++        return (price, updatedAt);
++    }
++
++    function setPrice(uint256 newPrice) external {
++        require(msg.sender == owner() || msg.sender == updater, "ManualSource: not authorized");
++        require(newPrice > 0, "ManualSource: zero price");
++        if (msg.sender != owner()) {
++            uint256 diff = newPrice > price ? newPrice - price : price - newPrice;
++            require((diff * 10_000) / price <= maxStepBps, "ManualSource: step too large");
++        }
++        emit PriceSet(price, newPrice, msg.sender);
++        price = newPrice;
++        updatedAt = block.timestamp;
++    }
++
++    function setUpdater(address updater_) external onlyOwner {
++        updater = updater_;
++        emit UpdaterSet(updater_);
++    }
++
++    function setMaxStepBps(uint256 bps) external onlyOwner {
++        require(bps > 0 && bps <= 10_000, "ManualSource: bad step");
++        maxStepBps = bps;
++        emit MaxStepSet(bps);
++    }
++}
+diff --git a/contracts/sources/FixedPriceSource.sol b/contracts/sources/FixedPriceSource.sol
+new file mode 100644
+index 0000000..7f7a10e
+--- /dev/null
++++ b/contracts/sources/FixedPriceSource.sol
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import {IPriceSource} from "../interfaces/IPriceSource.sol";
++
++/// @notice Immutable price, intended ONLY for pegged assets (USDRIF = 1e18).
++/// RISK: if the asset depegs, swaps keep valuing it at the fixed price. The
++/// station's per-swap and daily caps bound the loss; the token can be
++/// disabled with setToken(..., enabled = false).
++contract FixedPriceSource is IPriceSource {
++    uint256 public immutable price;
++
++    constructor(uint256 price_) {
++        require(price_ > 0, "FixedPriceSource: zero price");
++        price = price_;
++    }
++
++    function getPrice() external view returns (uint256, uint256) {
++        return (price, block.timestamp);
++    }
++}
+diff --git a/contracts/sources/MoCPriceSource.sol b/contracts/sources/MoCPriceSource.sol
+new file mode 100644
+index 0000000..8a57c75
+--- /dev/null
++++ b/contracts/sources/MoCPriceSource.sol
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.20;
++
++import {IPriceSource} from "../interfaces/IPriceSource.sol";
++import {IMoCBaseOracle} from "../interfaces/IMoCBaseOracle.sol";
++
++/// @notice Adapter: Money On Chain style oracle -> IPriceSource.
++/// `peek()` carries no timestamp, so freshness is the oracle's own `valid`
++/// flag. We report block.timestamp as updatedAt and revert when invalid.
++contract MoCPriceSource is IPriceSource {
++    IMoCBaseOracle public immutable oracle;
++
++    constructor(address oracle_) {
++        require(oracle_ != address(0), "MoCPriceSource: zero oracle");
++        oracle = IMoCBaseOracle(oracle_);
++    }
++
++    function getPrice() external view returns (uint256 priceUsd, uint256 updatedAt) {
++        (bytes32 raw, bool valid) = oracle.peek();
++        require(valid, "MoCPriceSource: oracle invalid");
++        priceUsd = uint256(raw);
++        require(priceUsd > 0, "MoCPriceSource: zero price");
++        updatedAt = block.timestamp;
++    }
++}
+diff --git a/deploy/deploy.ts b/deploy/deploy.ts
+deleted file mode 100644
+index bedbd49..0000000
+--- a/deploy/deploy.ts
++++ /dev/null
+@@ -1,64 +0,0 @@
+-import { ethers } from "hardhat";
+-
+-async function main() {
+-  const [deployer] = await ethers.getSigners();
+-
+-  console.log("Deploying from:", deployer.address);
+-  console.log(
+-    "Balance:",
+-    ethers.formatEther(await ethers.provider.getBalance(deployer.address)),
+-    "RBTC"
+-  );
+-
+-  const USDRIF_ADDRESS  = "0x19f64674d8a5b4e652319f5e239efd3bc969a1fe";
+-  const RIF_ADDRESS     = "0x19f64674d8a5b4e652319f5e239efd3bc969a1fe";
+-
+-  // ── Oracle feeds ───────────────────────────────────────────────────────
+-  // Set these to the real, verified IMoCBaseOracle-compatible feed addresses
+-  // for the network you're deploying to (check current addresses against
+-  // official Money On Chain / RedStone RSK docs before mainnet — do NOT
+-  // guess an address). Leave as ethers.ZeroAddress to start a token in
+-  // manual-rate mode instead (useful on testnet, or if no feed exists yet
+-  // for that token, e.g. RIF/stRIF pairs that don't have oracle coverage).
+-  const USDRIF_PRICE_FEED = ethers.ZeroAddress; // TODO: wire in real feed before mainnet
+-  const RIF_PRICE_FEED    = ethers.ZeroAddress; // TODO: wire in real feed before mainnet
+-
+-  // Manual fallback rates — used only while the corresponding oracle is disabled.
+-  const MANUAL_USDRIF_PER_RBTC = 3000n * 10n ** 18n;
+-  const MANUAL_RIF_PER_RBTC    = 1500n * 10n ** 18n;
+-
+-  const FEE_BPS         = 50;
+-  const MIN_RBTC_OUT    = ethers.parseEther("0.00001");
+-  const MAX_RBTC_OUT    = ethers.parseEther("0.0001");
+-  const SEED            = ethers.parseEther("0.0001");
+-
+-  const Factory    = await ethers.getContractFactory("RBTCGasStation");
+-
+-  // Step 1 — Deploy (no value here)
+-  const gasStation = await Factory.deploy(
+-    USDRIF_ADDRESS,
+-    RIF_ADDRESS,
+-    USDRIF_PRICE_FEED,
+-    RIF_PRICE_FEED,
+-    MANUAL_USDRIF_PER_RBTC,
+-    MANUAL_RIF_PER_RBTC,
+-    FEE_BPS,
+-    MIN_RBTC_OUT,
+-    MAX_RBTC_OUT
+-  );
+-  await gasStation.waitForDeployment();
+-  const address = await gasStation.getAddress();
+-  console.log("✅ Deployed at:", address);
+-
+-  // Step 2 — Fund the contract with RBTC separately
+-  const tx = await deployer.sendTransaction({
+-    to: address,
+-    value: SEED,
+-  });
+-  await tx.wait();
+-  console.log("✅ Funded with:", ethers.formatEther(SEED), "RBTC");
+-}
+-
+-main()
+-  .then(() => process.exit(0))
+-  .catch((err) => { console.error(err); process.exit(1); });
+\ No newline at end of file
+diff --git a/hardhat.config.ts b/hardhat.config.ts
+index 607bf49..4dc334b 100644
+--- a/hardhat.config.ts
++++ b/hardhat.config.ts
+@@ -1,97 +1,61 @@
+ import "@nomicfoundation/hardhat-toolbox";
+ import { HardhatUserConfig } from "hardhat/config";
+-import "hardhat-deploy";
+ import "@nomiclabs/hardhat-solhint";
+ import "solidity-coverage";
+ import "dotenv/config";
+ 
+-// Importing custom tasks
+ import "./tasks/utils/accounts";
+ import "./tasks/utils/balance";
+ import "./tasks/utils/block-number";
+ import "./tasks/utils/send-eth";
+ 
+-import "./tasks/erc721/mint";
+-import "./tasks/erc721/base-uri";
+-import "./tasks/erc721/contract-uri";
+-
+-import "./tasks/erc20/mint";
+-
+-import "./tasks/erc1155/mint";
+-import "./tasks/erc1155/base-uri";
+-import "./tasks/erc1155/contract-uri";
+-
+-const RSK_TESTNET_RPC_URL = process.env.RSK_TESTNET_RPC_URL;
++// Only needed for live networks. Compiling and running tests must work
++// without any secrets, so nothing here throws when they are missing.
++const RSK_TESTNET_RPC_URL = process.env.RSK_TESTNET_RPC_URL ?? "https://public-node.testnet.rsk.co";
++const RSK_MAINNET_RPC_URL = process.env.RSK_MAINNET_RPC_URL ?? "https://public-node.rsk.co";
+ const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
+-
+-if (!RSK_TESTNET_RPC_URL) {
+-    throw new Error("The RPC URL for the testnet is not configured.");
+-}
+-
+-if (!WALLET_PRIVATE_KEY) {
+-    throw new Error("Private key is not configured.");
+-}
++const accounts = WALLET_PRIVATE_KEY ? [WALLET_PRIVATE_KEY] : [];
+ 
+ const config: HardhatUserConfig = {
+     defaultNetwork: "hardhat",
+     networks: {
+         hardhat: {},
+-        localhost: {
+-            url: "http://127.0.0.1:8545",
+-        },
+-        rskTestnet: {
+-            url: RSK_TESTNET_RPC_URL,
+-            chainId: 31,
+-            gasPrice: 60000000,
+-            accounts: [WALLET_PRIVATE_KEY]
+-        },
++        localhost: { url: "http://127.0.0.1:8545" },
++        rskTestnet: { url: RSK_TESTNET_RPC_URL, chainId: 31, gasPrice: 60000000, accounts },
++        rskMainnet: { url: RSK_MAINNET_RPC_URL, chainId: 30, gasPrice: 60000000, accounts },
+     },
+     etherscan: {
+-        apiKey: {
+-            rsktestnet: 'your API key',
+-            rskmainnet: 'your API key'
+-        },
++        apiKey: { rskTestnet: "no-key-needed", rskMainnet: "no-key-needed" },
+         customChains: [
+             {
+-                network: "rsktestnet",
++                network: "rskTestnet",
+                 chainId: 31,
+                 urls: {
+                     apiURL: "https://rootstock-testnet.blockscout.com/api/",
+                     browserURL: "https://rootstock-testnet.blockscout.com/",
+-                }
++                },
+             },
+             {
+-                network: "rskmainnet",
++                network: "rskMainnet",
+                 chainId: 30,
+                 urls: {
+                     apiURL: "https://rootstock.blockscout.com/api/",
+                     browserURL: "https://rootstock.blockscout.com/",
+-                }
++                },
+             },
+-        ]
+-    },
+-    namedAccounts: {
+-        deployer: {
+-            default: 0,
+-            mainnet: 0,
+-        },
+-        owner: {
+-            default: 0,
+-        },
++        ],
+     },
+     solidity: {
+         compilers: [
+             {
+                 version: "0.8.20",
+                 settings: {
+-                    evmVersion: "london", // ✅ RSK testnet supports london
+-                    optimizer: {
+-                        enabled: false
+-                    }
+-                }
++                    evmVersion: "london", // RSK supports london
++                    optimizer: { enabled: true, runs: 200 },
++                },
+             },
+         ],
+     },
+ };
+ 
+-export default config;
+\ No newline at end of file
++export default config;
+diff --git a/package.json b/package.json
+index e924671..c88add5 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,9 @@
+ 		"compile": "hardhat compile",
+ 		"test": "hardhat test",
+ 		"coverage": "hardhat coverage",
+-		"deploy": "hardhat deploy",
++		"deploy:testnet": "hardhat run scripts/deploy.ts --network rskTestnet",
++		"inspect:testnet": "hardhat run scripts/inspectOnchain.ts --network rskTestnet",
++		"gas:testnet": "hardhat run scripts/measureGas.ts --network rskTestnet",
+ 		"node": "hardhat node",
+ 		"sol:format:check": "prettier --check --plugin=prettier-plugin-solidity 'contracts/**/*.sol'",
+ 		"sol:format:write": "prettier --write --plugin=prettier-plugin-solidity 'contracts/**/*.sol'",
+@@ -27,7 +29,6 @@
+ 		"@nomicfoundation/hardhat-toolbox": "^4.0.0",
+ 		"@nomicfoundation/hardhat-verify": "^2.0.0",
+ 		"@nomiclabs/hardhat-solhint": "4.0.2",
+-		"@openzeppelin/test-helpers": "^0.5.16",
+ 		"@typechain/ethers-v6": "^0.5.0",
+ 		"@typechain/hardhat": "^9.0.0",
+ 		"@types/chai": "^4.2.0",
+@@ -41,7 +42,6 @@
+ 		"eslint-plugin-prettier": "^5.0.1",
+ 		"ethers": "^6.8.1",
+ 		"hardhat": "^2.19.0",
+-		"hardhat-deploy": "1.0.4",
+ 		"hardhat-gas-reporter": "^1.0.8",
+ 		"prettier": "^3.0.3",
+ 		"prettier-plugin-solidity": "^1.2.0",
+diff --git a/scripts/deploy.ts b/scripts/deploy.ts
+new file mode 100644
+index 0000000..8a7a07e
+--- /dev/null
++++ b/scripts/deploy.ts
+@@ -0,0 +1,170 @@
++/**
++ * Deploys RBTCGasStation v2 and its price sources.
++ *
++ *   npx hardhat run scripts/deploy.ts --network rskTestnet
++ *
++ * Config is read from the environment (see .env.example). Nothing is guessed:
++ * token addresses are required and must be different from each other.
++ */
++import { ethers, network } from "hardhat";
++import * as fs from "fs";
++import * as path from "path";
++
++const env = (k: string, d?: string) => process.env[k] ?? d;
++const need = (k: string) => {
++  const v = process.env[k];
++  if (!v) throw new Error(`Missing env var ${k}`);
++  return v;
++};
++const addr = (k: string, v: string) => {
++  if (!ethers.isAddress(v)) throw new Error(`${k} is not a valid address: ${v}`);
++  return ethers.getAddress(v);
++};
++
++async function main() {
++  const [deployer] = await ethers.getSigners();
++  const provider = ethers.provider;
++  console.log(`Network: ${network.name}  Deployer: ${deployer.address}`);
++  console.log(`Balance: ${ethers.formatEther(await provider.getBalance(deployer.address))} RBTC`);
++
++  const finalOwner = addr("OWNER_ADDRESS", env("OWNER_ADDRESS", deployer.address)!);
++
++  // ---- tokens -------------------------------------------------------------
++  let usdrif: string;
++  let rif: string;
++  if (env("DEPLOY_MOCK_TOKENS") === "1") {
++    const Token = await ethers.getContractFactory("MockERC20");
++    const u = await Token.deploy("USDRIF", "USDRIF", 18);
++    const r = await Token.deploy("RIF", "RIF", 18);
++    await Promise.all([u.waitForDeployment(), r.waitForDeployment()]);
++    await (await u.mint(deployer.address, ethers.parseEther("1000"))).wait();
++    await (await r.mint(deployer.address, ethers.parseEther("100000"))).wait();
++    usdrif = await u.getAddress();
++    rif = await r.getAddress();
++    console.log("Mock tokens deployed (testing only):", usdrif, rif);
++  } else {
++    usdrif = addr("USDRIF_ADDRESS", need("USDRIF_ADDRESS"));
++    rif = addr("RIF_ADDRESS", need("RIF_ADDRESS"));
++  }
++  if (usdrif.toLowerCase() === rif.toLowerCase()) throw new Error("USDRIF and RIF addresses must be different");
++  for (const [name, a] of [["USDRIF", usdrif], ["RIF", rif]]) {
++    if ((await provider.getCode(a)) === "0x") throw new Error(`${name} has no contract code at ${a} on ${network.name}`);
++  }
++
++  // ---- price sources ------------------------------------------------------
++  const MANUAL_STEP_BPS = Number(env("MANUAL_MAX_STEP_BPS", "500"));
++  const btcOracle = env("BTC_ORACLE_ADDRESS");
++  const rifOracle = env("RIF_ORACLE_ADDRESS");
++  const usdrifOracle = env("USDRIF_ORACLE_ADDRESS");
++
++  const deployMoc = async (a: string) => {
++    const f = await ethers.getContractFactory("MoCPriceSource");
++    const c = await f.deploy(addr("oracle", a));
++    await c.waitForDeployment();
++    return c.getAddress();
++  };
++  const deployManual = async (label: string, initialUsd: string) => {
++    const f = await ethers.getContractFactory("BoundedManualPriceSource");
++    const c = await f.deploy(deployer.address, ethers.parseEther(initialUsd), MANUAL_STEP_BPS);
++    await c.waitForDeployment();
++    const updater = env("PRICE_UPDATER_ADDRESS");
++    if (updater) await (await c.setUpdater(addr("PRICE_UPDATER_ADDRESS", updater))).wait();
++    console.log(`${label}: manual source (initial $${initialUsd})`);
++    return c;
++  };
++
++  const manualSources: string[] = [];
++  let btcSource: string;
++  if (btcOracle) btcSource = await deployMoc(btcOracle);
++  else {
++    const c = await deployManual("BTC/USD", need("INITIAL_BTC_USD"));
++    btcSource = await c.getAddress();
++    manualSources.push(btcSource);
++  }
++  let rifSource: string;
++  if (rifOracle) rifSource = await deployMoc(rifOracle);
++  else {
++    const c = await deployManual("RIF/USD", need("INITIAL_RIF_USD"));
++    rifSource = await c.getAddress();
++    manualSources.push(rifSource);
++  }
++  let usdrifSource: string;
++  if (usdrifOracle) usdrifSource = await deployMoc(usdrifOracle);
++  else {
++    const f = await ethers.getContractFactory("FixedPriceSource");
++    const c = await f.deploy(ethers.parseEther("1"));
++    await c.waitForDeployment();
++    usdrifSource = await c.getAddress();
++    console.log("USDRIF: fixed $1 peg source (documented risk: no depeg protection beyond caps)");
++  }
++
++  // ---- station ------------------------------------------------------------
++  const params = {
++    btcPriceSource: btcSource,
++    gasRecoveryFeeUsd: ethers.parseEther(env("GAS_FEE_USD", "1.25")!),
++    minSwapUsd: ethers.parseEther(env("MIN_SWAP_USD", "5")!),
++    maxSwapUsd: ethers.parseEther(env("MAX_SWAP_USD", "10")!),
++    userDailyCapUsd: ethers.parseEther(env("USER_DAILY_CAP_USD", "10")!),
++    dailyOutflowCapWei: ethers.parseEther(env("DAILY_OUTFLOW_CAP_RBTC", "0.002")!),
++    reserveFloorWei: ethers.parseEther(env("RESERVE_FLOOR_RBTC", "0.0001")!),
++    maxPriceAge: Number(env("MAX_PRICE_AGE_SEC", "3600")),
++    maxDeviationBps: Number(env("MAX_DEVIATION_BPS", "1000")),
++  };
++  const spreadBps = Number(env("SPREAD_BPS", "50"));
++
++  const Station = await ethers.getContractFactory("RBTCGasStation");
++  const station = await Station.deploy(deployer.address, params);
++  await station.waitForDeployment();
++  const stationAddr = await station.getAddress();
++  console.log("RBTCGasStation:", stationAddr);
++
++  await (await station.setToken(usdrif, usdrifSource, spreadBps, true)).wait();
++  await (await station.setToken(rif, rifSource, spreadBps, true)).wait();
++  const guardian = env("GUARDIAN_ADDRESS");
++  if (guardian) await (await station.setGuardian(addr("GUARDIAN_ADDRESS", guardian))).wait();
++
++  const seed = ethers.parseEther(env("SEED_RBTC", "0.002")!);
++  if (seed > 0n) await (await deployer.sendTransaction({ to: stationAddr, value: seed })).wait();
++  await (await station.checkpointPrices()).wait();
++  console.log(`Reserve funded with ${ethers.formatEther(seed)} RBTC; price baseline checkpointed`);
++
++  // ---- hand over ownership (two-step: the new owner must accept) -----------
++  const pending: string[] = [];
++  if (finalOwner.toLowerCase() !== deployer.address.toLowerCase()) {
++    await (await station.transferOwnership(finalOwner)).wait();
++    pending.push(stationAddr);
++    for (const s of manualSources) {
++      const c = await ethers.getContractAt("BoundedManualPriceSource", s);
++      await (await c.transferOwnership(finalOwner)).wait();
++      pending.push(s);
++    }
++  }
++
++  // ---- save ---------------------------------------------------------------
++  const dir = path.join(__dirname, "..", "deployments");
++  fs.mkdirSync(dir, { recursive: true });
++  const out = {
++    network: network.name,
++    chainId: Number((await provider.getNetwork()).chainId),
++    deployedAt: new Date().toISOString(),
++    blockNumber: await provider.getBlockNumber(),
++    station: stationAddr,
++    tokens: { usdrif, rif },
++    priceSources: { btc: btcSource, rif: rifSource, usdrif: usdrifSource },
++    owner: finalOwner,
++    ownerMustAccept: pending,
++    params: Object.fromEntries(Object.entries(params).map(([k, v]) => [k, v.toString()])),
++    spreadBps,
++  };
++  fs.writeFileSync(path.join(dir, `${network.name}.json`), JSON.stringify(out, null, 2));
++  const stationArgs = [deployer.address, Object.values(params).map((v) => v.toString())]; // station is constructed with the deployer as owner
++  fs.writeFileSync(
++    path.join(dir, `${network.name}.station-args.js`),
++    `module.exports = ${JSON.stringify(stationArgs, null, 2)};\n`
++  );
++  console.log(`Saved deployments/${network.name}.json`);
++  console.log(`Verify:  npx hardhat verify --network ${network.name} --constructor-args deployments/${network.name}.station-args.js ${stationAddr}`);
++  if (pending.length) console.log(`OWNER ${finalOwner} must call acceptOwnership() on:\n  ${pending.join("\n  ")}`);
++}
++
++main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+diff --git a/scripts/deployLocal.ts b/scripts/deployLocal.ts
+deleted file mode 100644
+index 82bf499..0000000
+--- a/scripts/deployLocal.ts
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/**
+- * deployLocal.ts — standalone local deployment for testing priceKeeper.ts.
+- *
+- * Deliberately does NOT use `import { ethers } from "hardhat"` — this
+- * project also has hardhat-deploy installed, and mixing the two can break
+- * TypeScript's module augmentation for hardhat's injected `ethers`. This
+- * script instead uses the plain `ethers` package directly (same as
+- * priceKeeper.ts) and reads the compiled contract artifacts straight off
+- * disk, so it has zero dependency on the Hardhat runtime environment or
+- * hardhat-deploy's task system.
+- *
+- * Run, in order:
+- *   1. npx hardhat compile              (generates artifacts/ with ABI + bytecode)
+- *   2. npx hardhat node --no-deploy     (starts a local chain; --no-deploy
+- *                                        skips hardhat-deploy auto-running
+- *                                        deploy/deploy.ts, which isn't
+- *                                        shaped for hardhat-deploy yet)
+- *   3. npx ts-node scripts/deployLocal.ts
+- */
+-
+-import { ethers } from "ethers";
+-import * as fs from "fs";
+-import * as path from "path";
+-
+-const RPC_URL = "http://127.0.0.1:8545";
+-
+-// Hardhat's standard built-in test mnemonic ("test test test ... junk")
+-// always derives these same local accounts #0 and #1. These are copied
+-// EXACTLY from this project's own `npx hardhat node` output — always
+-// prefer what YOUR terminal printed over any hardcoded value (including
+-// this one), since a single mistyped hex character makes ethers reject
+-// the key outright.
+-const DEPLOYER_KEY =
+-  process.env.LOCAL_DEPLOYER_KEY ??
+-  "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+-const PRICE_UPDATER_KEY =
+-  process.env.LOCAL_PRICE_UPDATER_KEY ??
+-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+-
+-function loadArtifact(sourceFile: string, contractName: string) {
+-  const artifactPath = path.join(
+-    __dirname,
+-    "..",
+-    "artifacts",
+-    "contracts",
+-    sourceFile,
+-    `${contractName}.json`
+-  );
+-  if (!fs.existsSync(artifactPath)) {
+-    throw new Error(
+-      `Artifact not found at ${artifactPath} — did you run 'npx hardhat compile' first?`
+-    );
+-  }
+-  return JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+-}
+-
+-async function main() {
+-  for (const [name, key] of [
+-    ["DEPLOYER_KEY", DEPLOYER_KEY],
+-    ["PRICE_UPDATER_KEY", PRICE_UPDATER_KEY],
+-  ] as const) {
+-    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+-      throw new Error(
+-        `${name} is not a valid 32-byte private key (got ${key.length} chars). ` +
+-          `Copy it again, exactly, from your 'npx hardhat node' terminal output.`
+-      );
+-    }
+-  }
+-
+-  const provider = new ethers.JsonRpcProvider(RPC_URL);
+-  const deployer = new ethers.Wallet(DEPLOYER_KEY, provider);
+-  const priceUpdater = new ethers.Wallet(PRICE_UPDATER_KEY, provider);
+-
+-  // Confirm we can actually reach the local node before doing anything else.
+-  try {
+-    await provider.getBlockNumber();
+-  } catch {
+-    throw new Error(
+-      `Could not reach ${RPC_URL} — is 'npx hardhat node --no-deploy' running in another terminal?`
+-    );
+-  }
+-
+-  console.log("Deploying mock tokens...");
+-  let nonce = await provider.getTransactionCount(deployer.address);
+-
+-  const mockErc20Artifact = loadArtifact("MockERC20.sol", "MockERC20");
+-  const MockERC20 = new ethers.ContractFactory(mockErc20Artifact.abi, mockErc20Artifact.bytecode, deployer);
+-
+-  const usdrif = await MockERC20.deploy("Mock USDRIF", "mUSDRIF", { nonce: nonce++ });
+-  await usdrif.waitForDeployment();
+-
+-  const rif = await MockERC20.deploy("Mock RIF", "mRIF", { nonce: nonce++ });
+-  await rif.waitForDeployment();
+-
+-  console.log("Deploying RBTCGasStation (manual mode — no oracle feeds set)...");
+-  const stationArtifact = loadArtifact("RBTCGasStation.sol", "RBTCGasStation");
+-  const Factory = new ethers.ContractFactory(stationArtifact.abi, stationArtifact.bytecode, deployer);
+-
+-  const station = await Factory.deploy(
+-    await usdrif.getAddress(),
+-    await rif.getAddress(),
+-    ethers.ZeroAddress, // no USDRIF oracle — manual mode
+-    ethers.ZeroAddress, // no RIF oracle — manual mode
+-    ethers.parseEther("3000"), // placeholder starting rate, priceKeeper will overwrite this
+-    ethers.parseEther("1500"),
+-    50,
+-    ethers.parseEther("0.00001"),
+-    ethers.parseEther("1"),
+-    { nonce: nonce++ }
+-  );
+-  await station.waitForDeployment();
+-  const stationAddress = await station.getAddress();
+-
+-  console.log("Setting priceUpdater to the second local test account...");
+-  const tx = await (station as any).connect(deployer).setPriceUpdater(priceUpdater.address, { nonce: nonce++ });
+-  await tx.wait();
+-
+-  console.log("\n─────────────────────────────────────────────");
+-  console.log("Copy these into your .env for testing priceKeeper.ts:\n");
+-  console.log(`RSK_RPC_URL=${RPC_URL}`);
+-  console.log(`GAS_STATION_ADDRESS=${stationAddress}`);
+-  console.log(`PRICE_UPDATER_PRIVATE_KEY=${PRICE_UPDATER_KEY}`);
+-  console.log("─────────────────────────────────────────────\n");
+-}
+-
+-main().catch((err) => {
+-  console.error("❌", err.message ?? err);
+-  process.exitCode = 1;
+-});
+\ No newline at end of file
+diff --git a/scripts/inspectOnchain.ts b/scripts/inspectOnchain.ts
+new file mode 100644
+index 0000000..a59c03a
+--- /dev/null
++++ b/scripts/inspectOnchain.ts
+@@ -0,0 +1,60 @@
++/**
++ * T1: read-only checks of the real tokens and oracles you plan to use.
++ *
++ *   INSPECT_TOKENS=0xTokenA,0xTokenB INSPECT_ORACLES=0xOracle1,0xOracle2 \
++ *   npx hardhat run scripts/inspectOnchain.ts --network rskTestnet
++ *
++ * Get oracle addresses from Money On Chain's official docs (do not guess).
++ * Nothing is sent on-chain.
++ */
++import { ethers } from "hardhat";
++
++const list = (k: string) => (process.env[k] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
++const tryCall = async <T>(f: () => Promise<T>): Promise<T | undefined> => { try { return await f(); } catch { return undefined; } };
++
++async function inspectToken(a: string) {
++  const p = ethers.provider;
++  const code = await p.getCode(a);
++  console.log(`\nTOKEN ${a}`);
++  if (code === "0x") return console.log("  NO CONTRACT CODE on this network");
++  const c = new ethers.Contract(a, [
++    "function name() view returns (string)", "function symbol() view returns (string)",
++    "function decimals() view returns (uint8)", "function totalSupply() view returns (uint256)",
++    "function DOMAIN_SEPARATOR() view returns (bytes32)", "function nonces(address) view returns (uint256)",
++  ], p);
++  const [name, symbol, decimals, supply] = await Promise.all([
++    tryCall(() => c.name()), tryCall(() => c.symbol()), tryCall(() => c.decimals()), tryCall(() => c.totalSupply()),
++  ]);
++  console.log(`  name=${name} symbol=${symbol} decimals=${decimals} totalSupply=${supply?.toString()}`);
++  const ds = await tryCall(() => c.DOMAIN_SEPARATOR());
++  const nonce = await tryCall(() => c.nonces(ethers.ZeroAddress));
++  console.log(`  permit (EIP-2612) likely: ${ds !== undefined && nonce !== undefined}`);
++  console.log(`  ERC-677 transferAndCall selector in code: ${code.toLowerCase().includes("4000aea0")}`);
++  const impl = await p.getStorage(a, "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");
++  console.log(`  EIP-1967 proxy: ${BigInt(impl) !== 0n ? "yes, implementation " + ethers.getAddress("0x" + impl.slice(26)) : "no"}`);
++}
++
++async function inspectOracle(a: string) {
++  const p = ethers.provider;
++  console.log(`\nORACLE ${a}`);
++  if ((await p.getCode(a)) === "0x") return console.log("  NO CONTRACT CODE on this network");
++  const moc = new ethers.Contract(a, ["function peek() view returns (bytes32,bool)"], p);
++  const r = await tryCall(() => moc.peek());
++  if (r) {
++    const raw = BigInt(r[0]);
++    console.log(`  peek(): raw=${raw} valid=${r[1]}  as 1e18-scaled USD = ${ethers.formatEther(raw)}`);
++    console.log("  CHECK: this must look like a USD price per 1 whole asset (e.g. ~80000 for BTC).");
++  } else console.log("  peek() not available");
++  const cl = new ethers.Contract(a, ["function latestAnswer() view returns (int256)", "function decimals() view returns (uint8)"], p);
++  const ans = await tryCall(() => cl.latestAnswer());
++  if (ans !== undefined) console.log(`  latestAnswer()=${ans} decimals=${await tryCall(() => cl.decimals())} (Chainlink-style; needs its own adapter)`);
++}
++
++async function main() {
++  const net = await ethers.provider.getNetwork();
++  console.log(`Chain ${net.chainId}, block ${await ethers.provider.getBlockNumber()}`);
++  for (const t of list("INSPECT_TOKENS")) await inspectToken(ethers.getAddress(t));
++  for (const o of list("INSPECT_ORACLES")) await inspectOracle(ethers.getAddress(o));
++  if (!list("INSPECT_TOKENS").length && !list("INSPECT_ORACLES").length) console.log("Set INSPECT_TOKENS and/or INSPECT_ORACLES.");
++}
++main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+diff --git a/scripts/measureGas.ts b/scripts/measureGas.ts
+new file mode 100644
+index 0000000..b8e5c0b
+--- /dev/null
++++ b/scripts/measureGas.ts
+@@ -0,0 +1,55 @@
++/**
++ * T2: measure the real gas cost of approve + swap, to size the gas recovery
++ * fee and the sponsor amount.
++ *
++ *   STATION=0x... TOKEN=0x... AMOUNT=5 BTC_USD=80000 \
++ *   npx hardhat run scripts/measureGas.ts --network rskTestnet
++ *
++ * The signer (WALLET_PRIVATE_KEY) needs the token and a little RBTC. The
++ * approve is sent for real; the swap is only estimated unless SEND_SWAP=1.
++ */
++import { ethers } from "hardhat";
++
++const need = (k: string) => { const v = process.env[k]; if (!v) throw new Error(`Missing env var ${k}`); return v; };
++
++async function main() {
++  const [signer] = await ethers.getSigners();
++  const station = await ethers.getContractAt("RBTCGasStation", ethers.getAddress(need("STATION")), signer);
++  const tokenAddr = ethers.getAddress(need("TOKEN"));
++  const token = new ethers.Contract(tokenAddr, [
++    "function approve(address,uint256) returns (bool)", "function allowance(address,address) view returns (uint256)",
++    "function decimals() view returns (uint8)", "function balanceOf(address) view returns (uint256)",
++  ], signer);
++  const dec = Number(await token.decimals());
++  const amount = ethers.parseUnits(process.env.AMOUNT ?? "5", dec);
++  const btcUsd = Number(process.env.BTC_USD ?? "80000");
++  const stationAddr = await station.getAddress();
++
++  const fee = await ethers.provider.getFeeData();
++  const gasPrice = fee.gasPrice ?? 0n;
++  console.log(`Signer ${signer.address}  gasPrice ${gasPrice} wei`);
++
++  const [q, status] = await station.previewSwap(tokenAddr, amount, signer.address);
++  console.log(`previewSwap status=${status} (0 = OK) netRBTC=${ethers.formatEther(q.netRBTC)}`);
++
++  const approveGas = await token.approve.estimateGas(stationAddr, amount);
++  if ((await token.allowance(signer.address, stationAddr)) < amount) {
++    console.log("Sending approve (real tx)...");
++    await (await token.approve(stationAddr, amount)).wait();
++  }
++  const swapGas = await station.swap.estimateGas(tokenAddr, amount, 0, Math.floor(Date.now() / 1000) + 3600);
++  if (process.env.SEND_SWAP === "1") {
++    const rc = await (await station.swap(tokenAddr, amount, 0, Math.floor(Date.now() / 1000) + 3600)).wait();
++    console.log(`Actual swap gasUsed=${rc!.gasUsed}`);
++  }
++
++  const usd = (wei: bigint) => (Number(ethers.formatEther(wei)) * btcUsd).toFixed(4);
++  const aCost = approveGas * gasPrice, sCost = swapGas * gasPrice, total = aCost + sCost;
++  console.log(`\napprove gas ${approveGas}  -> ${ethers.formatEther(aCost)} RBTC (~$${usd(aCost)})`);
++  console.log(`swap    gas ${swapGas}  -> ${ethers.formatEther(sCost)} RBTC (~$${usd(sCost)})`);
++  console.log(`TOTAL   ${ethers.formatEther(total)} RBTC (~$${usd(total)}) at BTC=$${btcUsd}`);
++  console.log(`\nSuggested starting points (my rule of thumb, adjust):`);
++  console.log(`  GAS_FEE_USD       ~ ${(Number(usd(total)) * 1.2).toFixed(2)}   (1.2x real cost)`);
++  console.log(`  sponsor amount    ~ ${ethers.formatEther((total * 3n) / 2n)} RBTC   (1.5x real cost)`);
++}
++main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+diff --git a/deploy/mintTokens.ts b/scripts/mintTestTokens.ts
+similarity index 79%
+rename from deploy/mintTokens.ts
+rename to scripts/mintTestTokens.ts
+index 5f73218..f49a5e7 100644
+--- a/deploy/mintTokens.ts
++++ b/scripts/mintTestTokens.ts
+@@ -9,11 +9,11 @@ async function main() {
+   const artifact = require("../artifacts/contracts/MockERC20.sol/MockERC20.json");
+   const factory  = new ethers.ContractFactory(artifact.abi, artifact.bytecode, signer);
+ 
+-  const usdrif = await factory.deploy("USDRIF", "USDRIF");
++  const usdrif = await factory.deploy("USDRIF", "USDRIF", 18);
+   await usdrif.waitForDeployment();
+   console.log("✅ USDRIF deployed at:", await usdrif.getAddress());
+ 
+-  const rif = await factory.deploy("RIF", "RIF");
++  const rif = await factory.deploy("RIF", "RIF", 18);
+   await rif.waitForDeployment();
+   console.log("✅ RIF deployed at:", await rif.getAddress());
+ }
+diff --git a/tasks/erc1155/base-uri.ts b/tasks/erc1155/base-uri.ts
+deleted file mode 100644
+index 4bcc401..0000000
+--- a/tasks/erc1155/base-uri.ts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc1155-base-uri \
+- --contract 0x320bd6de80d3D5361e1c9bB4CF1D7D9Ef24F3Ac7 \
+- --uri https://ipfs.io/ipfs/new-base-uri-ipfs-hash/ \
+- --network rskTestnet
+- */
+-task("erc1155-base-uri", "Set new base URI for BasicERC1155 Smart Contract")
+-	.addParam<string>("contract", "BasicERC1155 Smart Contract Address")
+-	.addParam<string>("uri", "New Base URI")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC1155", taskArgs.contract)
+-
+-		const trx = await contract.setURI(taskArgs.uri)
+-
+-		console.log(`Transaction Hash: ${trx.hash}`)
+-		await trx.wait(2)
+-		console.log("Transaction confirmed")
+-	})
+diff --git a/tasks/erc1155/contract-uri.ts b/tasks/erc1155/contract-uri.ts
+deleted file mode 100644
+index 9fd3df1..0000000
+--- a/tasks/erc1155/contract-uri.ts
++++ /dev/null
+@@ -1,25 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc1155-contract-uri \
+- --contract 0x320bd6de80d3D5361e1c9bB4CF1D7D9Ef24F3Ac7 \
+- --uri https://ipfs.io/ipfs/new-contract-uri-ipfs-hash \
+- --network rskTestnet
+- */
+-task("erc1155-contract-uri", "Set new Contract URI for BasicERC1155 Smart Contract")
+-	.addParam<string>("contract", "BasicERC1155 Smart Contract Address")
+-	.addParam<string>("uri", "New Contract URI")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC1155", taskArgs.contract)
+-
+-		console.log(`Current Contract URI: ${await contract.contractURI()}`)
+-
+-		const trx = await contract.setContractURI(taskArgs.uri)
+-
+-		console.log(`Transaction Hash: ${trx.hash}`)
+-		await trx.wait(2)
+-		console.log("Transaction confirmed")
+-
+-		console.log(`New Contract URI: ${await contract.contractURI()}`)
+-	})
+diff --git a/tasks/erc1155/mint.ts b/tasks/erc1155/mint.ts
+deleted file mode 100644
+index fd781b3..0000000
+--- a/tasks/erc1155/mint.ts
++++ /dev/null
+@@ -1,25 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc1155-mint \
+- --contract 0x320bd6de80d3D5361e1c9bB4CF1D7D9Ef24F3Ac7 \
+- --recipient 0x73faDd7E476a9Bc2dA6D1512A528366A3E50c3cF \
+- --id 1 \
+- --amount 10 \
+- --network rskTestnet
+- */
+-task("erc1155-mint", "Mint tokens for BasicERC1155 Smart Contract")
+-	.addParam<string>("contract", "BasicERC1155 Smart Contract Address")
+-	.addParam<string>("recipient", "Token Recipient")
+-	.addParam<string>("id", "Token ID")
+-	.addParam<string>("amount", "Token Amount")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC1155", taskArgs.contract)
+-
+-		const mintTrx = await contract.mint(taskArgs.recipient, taskArgs.id, taskArgs.amount)
+-
+-		console.log(`Transaction Hash: ${mintTrx.hash}`)
+-		await mintTrx.wait(2)
+-		console.log("Transaction confirmed")
+-	})
+diff --git a/tasks/erc20/mint.ts b/tasks/erc20/mint.ts
+deleted file mode 100644
+index db1f05c..0000000
+--- a/tasks/erc20/mint.ts
++++ /dev/null
+@@ -1,23 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc20-mint \
+- --contract 0xca6C5326076fe4a1a2369D5Ed8Dd7162c922CD1D \
+- --recipient 0x73faDd7E476a9Bc2dA6D1512A528366A3E50c3cF \
+- --amount 10000 \
+- --network rskTestnet
+- */
+-task("erc20-mint", "Mint tokens for BasicERC20 Smart Contract")
+-	.addParam<string>("contract", "BasicERC20 Smart Contract Address")
+-	.addParam<string>("recipient", "ERC20 Tokens Recipient")
+-	.addParam<string>("amount", "ERC20 Tokens Amount")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC20", taskArgs.contract)
+-
+-		const mintTrx = await contract.mint(taskArgs.recipient, taskArgs.amount)
+-
+-		console.log(`Transaction Hash: ${mintTrx.hash}`)
+-		await mintTrx.wait(2)
+-		console.log("Transaction confirmed")
+-	})
+diff --git a/tasks/erc721/base-uri.ts b/tasks/erc721/base-uri.ts
+deleted file mode 100644
+index 6136ee5..0000000
+--- a/tasks/erc721/base-uri.ts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc721-base-uri \
+- --contract 0x77337983A7D1699FaF51a5f43b9907fB7B614097 \
+- --uri https://ipfs.io/ipfs/new-base-uri-ipfs-hash/ \
+- --network rskTestnet
+- */
+-task("erc721-base-uri", "Set new base URI for BasicERC721 Smart Contract")
+-	.addParam<string>("contract", "BasicERC721 Smart Contract Address")
+-	.addParam<string>("uri", "New Base URI")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC721", taskArgs.contract)
+-
+-		const trx = await contract.setBaseURI(taskArgs.uri)
+-
+-		console.log(`Transaction Hash: ${trx.hash}`)
+-		await trx.wait(2)
+-		console.log("Transaction confirmed")
+-	})
+diff --git a/tasks/erc721/contract-uri.ts b/tasks/erc721/contract-uri.ts
+deleted file mode 100644
+index ad8cc4b..0000000
+--- a/tasks/erc721/contract-uri.ts
++++ /dev/null
+@@ -1,25 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc721-contract-uri \
+- --contract 0x77337983A7D1699FaF51a5f43b9907fB7B614097 \
+- --uri https://ipfs.io/ipfs/new-contract-uri-ipfs-hash \
+- --network rskTestnet
+- */
+-task("erc721-contract-uri", "Set new Contract URI for BasicERC721 Smart Contract")
+-	.addParam<string>("contract", "BasicERC721 Smart Contract Address")
+-	.addParam<string>("uri", "New Contract URI")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC721", taskArgs.contract)
+-
+-		console.log(`Current Contract URI: ${await contract.contractURI()}`)
+-
+-		const trx = await contract.setContractURI(taskArgs.uri)
+-
+-		console.log(`Transaction Hash: ${trx.hash}`)
+-		await trx.wait(2)
+-		console.log("Transaction confirmed")
+-
+-		console.log(`New Contract URI: ${await contract.contractURI()}`)
+-	})
+diff --git a/tasks/erc721/mint.ts b/tasks/erc721/mint.ts
+deleted file mode 100644
+index ddd2dfd..0000000
+--- a/tasks/erc721/mint.ts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-import { task } from "hardhat/config"
+-
+-/**
+- Example:
+- hardhat erc721-mint \
+- --contract 0x77337983A7D1699FaF51a5f43b9907fB7B614097 \
+- --recipient 0x73faDd7E476a9Bc2dA6D1512A528366A3E50c3cF \
+- --network rskTestnet
+- */
+-task("erc721-mint", "Mint token for BasicERC721 Smart Contract")
+-	.addParam<string>("contract", "BasicERC721 Smart Contract Address")
+-	.addParam<string>("recipient", "NFT Token Recipient")
+-	.setAction(async (taskArgs, { ethers }) => {
+-		const contract = await ethers.getContractAt("MockERC721", taskArgs.contract)
+-
+-		const mintTrx = await contract.safeMint(taskArgs.recipient)
+-
+-		console.log(`Transaction Hash: ${mintTrx.hash}`)
+-		await mintTrx.wait(2)
+-		console.log("Transaction confirmed")
+-	})
+diff --git a/test/RBTCGasStation.test.ts b/test/RBTCGasStation.test.ts
+index 2b2e0cb..6ea8cb2 100644
+--- a/test/RBTCGasStation.test.ts
++++ b/test/RBTCGasStation.test.ts
+@@ -1,527 +1,377 @@
+ import { expect } from "chai";
+ import { ethers } from "hardhat";
+-import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+-
+-describe("RBTCGasStation", function () {
+-
+-  // ── Constants ──────────────────────────────────────────────────────────────
+-  const USDRIF_PER_RBTC = 3000n * 10n ** 18n;
+-  const RIF_PER_RBTC    = 1500n * 10n ** 18n;
+-  const FEE_BPS         = 50n;
+-  const MIN_RBTC_OUT    = ethers.parseEther("0.00001");  // 0.00001 RBTC
+-  const MAX_RBTC_OUT    = ethers.parseEther("0.0001");   // 0.0001  RBTC
+-  const SEED_RBTC       = ethers.parseEther("1");
+-
+-  // Token amounts that produce RBTC within [MIN, MAX]:
+-  // 0.0001 RBTC * 3000 USDRIF/RBTC = 0.3 USDRIF → use 0.27 USDRIF (leaves fee headroom)
+-  // USDRIF: 0.27 * 1e18 → gives ~0.00009 RBTC (within limits)
+-  // RIF:    0.135 * 1e18 → gives ~0.00009 RBTC (within limits)
+-  const USDRIF_AMOUNT_IN = ethers.parseEther("0.27");   // → ~0.00009 RBTC out
+-  const RIF_AMOUNT_IN    = ethers.parseEther("0.135");  // → ~0.00009 RBTC out
+-
+-  // ── Fixture ────────────────────────────────────────────────────────────────
+-  async function deployFixture() {
+-    const [owner, user, other] = await ethers.getSigners();
+-
+-    const MockERC20 = await ethers.getContractFactory("MockERC20");
+-    const usdrif = await MockERC20.deploy("USDRIF", "USDRIF");
+-    const rif    = await MockERC20.deploy("RIF", "RIF");
+-
+-    const Factory = await ethers.getContractFactory("RBTCGasStation");
+-    const gasStation = await Factory.deploy(
+-      await usdrif.getAddress(),
+-      await rif.getAddress(),
+-      USDRIF_PER_RBTC,
+-      RIF_PER_RBTC,
+-      FEE_BPS,
+-      MIN_RBTC_OUT,
+-      MAX_RBTC_OUT
+-    );
+-    await gasStation.waitForDeployment();
+-
+-    // Fund contract separately
+-    await owner.sendTransaction({
+-      to: await gasStation.getAddress(),
+-      value: SEED_RBTC,
+-    });
+-
+-    // Mint tokens to user
+-    await usdrif.mint(user.address, 10_000n * 10n ** 18n);
+-    await rif.mint(user.address,    10_000n * 10n ** 18n);
+-
+-    return { gasStation, usdrif, rif, owner, user, other };
++import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
++
++const E = (n: string) => ethers.parseEther(n);
++const S = {
++  OK: 0, PAUSED: 1, BREAKER_TRIPPED: 2, TOKEN_NOT_ENABLED: 3, PRICE_UNAVAILABLE: 4, PRICE_STALE: 5,
++  PRICE_DEVIATION: 6, BELOW_MIN_SWAP: 7, ABOVE_MAX_SWAP: 8, AMOUNT_TOO_SMALL: 9,
++  USER_DAILY_CAP: 10, GLOBAL_DAILY_CAP: 11, RESERVE_FLOOR: 12,
++};
++
++const BTC_USD = E("80000");
++const RIF_USD = E("0.075");
++const GAS_FEE_USD = E("0.75");
++const SPREAD_BPS = 50;
++
++async function deployFixture() {
++  const [owner, user, user2, guardian, other] = await ethers.getSigners();
++
++  const Token = await ethers.getContractFactory("MockERC20");
++  const usdrif = await Token.deploy("USDRIF", "USDRIF", 18);
++  const rif = await Token.deploy("RIF", "RIF", 18);
++  const usdc6 = await Token.deploy("USDC6", "USDC6", 6);
++
++  const Manual = await ethers.getContractFactory("BoundedManualPriceSource");
++  const btcSrc = await Manual.deploy(owner.address, BTC_USD, 500);
++  const rifSrc = await Manual.deploy(owner.address, RIF_USD, 500);
++  const Fixed = await ethers.getContractFactory("FixedPriceSource");
++  const usdSrc = await Fixed.deploy(E("1"));
++
++  const Station = await ethers.getContractFactory("RBTCGasStation");
++  const station = await Station.deploy(owner.address, {
++    btcPriceSource: await btcSrc.getAddress(),
++    gasRecoveryFeeUsd: GAS_FEE_USD,
++    minSwapUsd: E("2"),
++    maxSwapUsd: E("10"),
++    userDailyCapUsd: E("10"),
++    dailyOutflowCapWei: E("0.001"),
++    reserveFloorWei: E("0.0001"),
++    maxPriceAge: 3600,
++    maxDeviationBps: 1000,
++  });
++  const stationAddr = await station.getAddress();
++
++  await station.setToken(await usdrif.getAddress(), await usdSrc.getAddress(), SPREAD_BPS, true);
++  await station.setToken(await rif.getAddress(), await rifSrc.getAddress(), SPREAD_BPS, true);
++  await station.setToken(await usdc6.getAddress(), await usdSrc.getAddress(), SPREAD_BPS, true);
++
++  await owner.sendTransaction({ to: stationAddr, value: E("0.01") });
++  await station.checkpointPrices();
++
++  for (const u of [user, user2]) {
++    await usdrif.mint(u.address, E("1000"));
++    await rif.mint(u.address, E("100000"));
++    await usdc6.mint(u.address, 1_000_000_000n);
++    await usdrif.connect(u).approve(stationAddr, ethers.MaxUint256);
++    await rif.connect(u).approve(stationAddr, ethers.MaxUint256);
++    await usdc6.connect(u).approve(stationAddr, ethers.MaxUint256);
+   }
+ 
+-  // ── 1. Deployment ──────────────────────────────────────────────────────────
+-  describe("Deployment", function () {
+-
+-    it("sets the correct owner", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      expect(await gasStation.owner()).to.equal(owner.address);
+-    });
+-
+-    it("stores correct USDRIF rate", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.usdrifPerRBTC()).to.equal(USDRIF_PER_RBTC);
+-    });
+-
+-    it("stores correct RIF rate", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.rifPerRBTC()).to.equal(RIF_PER_RBTC);
+-    });
+-
+-    it("stores correct fee", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.feeBps()).to.equal(FEE_BPS);
+-    });
+-
+-    it("stores correct limits", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.minRBTCOut()).to.equal(MIN_RBTC_OUT);
+-      expect(await gasStation.maxRBTCOut()).to.equal(MAX_RBTC_OUT);
+-    });
+-
+-    it("is not paused on deploy", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.paused()).to.equal(false);
++  return { owner, user, user2, guardian, other, usdrif, rif, usdc6, btcSrc, rifSrc, usdSrc, station, stationAddr };
++}
++
++const deadline = async () => (await time.latest()) + 3600;
++
++function expectedNet(valueUsd: bigint, btcUsd = BTC_USD, spreadBps = SPREAD_BPS) {
++  const gross = (valueUsd * E("1")) / btcUsd;
++  const gas = (GAS_FEE_USD * E("1")) / btcUsd;
++  const spread = (gross * BigInt(spreadBps)) / 10_000n;
++  return { gross, gas, spread, net: gross - gas - spread };
++}
++
++describe("RBTCGasStation v2", function () {
++  describe("deployment", function () {
++    it("stores the configured limits and guards", async function () {
++      const { station } = await loadFixture(deployFixture);
++      expect(await station.minSwapUsd()).to.equal(E("2"));
++      expect(await station.maxSwapUsd()).to.equal(E("10"));
++      expect(await station.maxPriceAge()).to.equal(3600);
++      expect(await station.tokenCount()).to.equal(3);
++    });
++
++    it("rejects invalid parameters", async function () {
++      const { owner, btcSrc } = await loadFixture(deployFixture);
++      const Station = await ethers.getContractFactory("RBTCGasStation");
++      const ok = {
++        btcPriceSource: await btcSrc.getAddress(), gasRecoveryFeeUsd: GAS_FEE_USD, minSwapUsd: E("2"),
++        maxSwapUsd: E("10"), userDailyCapUsd: E("10"), dailyOutflowCapWei: E("0.001"),
++        reserveFloorWei: 0n, maxPriceAge: 3600, maxDeviationBps: 1000,
++      };
++      await expect(Station.deploy(owner.address, { ...ok, btcPriceSource: ethers.ZeroAddress })).to.be.revertedWith("GasStation: source not a contract");
++      await expect(Station.deploy(owner.address, { ...ok, minSwapUsd: E("11") })).to.be.revertedWith("GasStation: bad swap range");
++      await expect(Station.deploy(owner.address, { ...ok, userDailyCapUsd: E("5") })).to.be.revertedWith("GasStation: user cap < max swap");
++      await expect(Station.deploy(owner.address, { ...ok, maxDeviationBps: 0 })).to.be.revertedWith("GasStation: bad deviation");
++      await expect(Station.deploy(owner.address, { ...ok, maxPriceAge: 0 })).to.be.revertedWith("GasStation: zero max age");
+     });
++  });
+ 
+-    it("RBTC reserve equals seeded amount", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      expect(await gasStation.rbtcReserve()).to.equal(SEED_RBTC);
++  describe("previewSwap", function () {
++    it("matches the hand-computed quote for $5 of USDRIF", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const [q, status] = await station.previewSwap(await usdrif.getAddress(), E("5"), user.address);
++      expect(status).to.equal(S.OK);
++      expect(q.netRBTC).to.equal(52_812_500_000_000n); // anchor value, 0.0000528125 RBTC
++      const e = expectedNet(E("5"));
++      expect(q.grossRBTC).to.equal(e.gross);
++      expect(q.gasFeeRBTC).to.equal(e.gas);
++      expect(q.spreadRBTC).to.equal(e.spread);
++      expect(q.tokensPerRBTC).to.equal(E("80000"));
+     });
+ 
+-    it("reverts if minRBTCOut > maxRBTCOut", async function () {
+-      const MockERC20 = await ethers.getContractFactory("MockERC20");
+-      const usdrif = await MockERC20.deploy("USDRIF", "USDRIF");
+-      const rif    = await MockERC20.deploy("RIF", "RIF");
+-      const Factory = await ethers.getContractFactory("RBTCGasStation");
+-
+-      await expect(
+-        Factory.deploy(
+-          await usdrif.getAddress(),
+-          await rif.getAddress(),
+-          USDRIF_PER_RBTC,
+-          RIF_PER_RBTC,
+-          FEE_BPS,
+-          ethers.parseEther("1"),
+-          ethers.parseEther("0.1")
+-        )
+-      ).to.be.revertedWith("GasStation: min > max");
++    it("prices RIF through its own USD price", async function () {
++      const { station, rif, user } = await loadFixture(deployFixture);
++      const [q, status] = await station.previewSwap(await rif.getAddress(), E("100"), user.address); // $7.50
++      expect(status).to.equal(S.OK);
++      expect(q.valueUsd).to.equal(E("7.5"));
++      expect(q.netRBTC).to.equal(expectedNet(E("7.5")).net);
+     });
+ 
+-    it("reverts if fee >= 100%", async function () {
+-      const MockERC20 = await ethers.getContractFactory("MockERC20");
+-      const usdrif = await MockERC20.deploy("USDRIF", "USDRIF");
+-      const rif    = await MockERC20.deploy("RIF", "RIF");
+-      const Factory = await ethers.getContractFactory("RBTCGasStation");
+-
+-      await expect(
+-        Factory.deploy(
+-          await usdrif.getAddress(),
+-          await rif.getAddress(),
+-          USDRIF_PER_RBTC,
+-          RIF_PER_RBTC,
+-          10_000,
+-          MIN_RBTC_OUT,
+-          MAX_RBTC_OUT
+-        )
+-      ).to.be.revertedWith("GasStation: fee >= 100%");
++    it("handles tokens with 6 decimals", async function () {
++      const { station, usdc6, user } = await loadFixture(deployFixture);
++      const [q, status] = await station.previewSwap(await usdc6.getAddress(), 5_000_000n, user.address);
++      expect(status).to.equal(S.OK);
++      expect(q.valueUsd).to.equal(E("5"));
++      expect(q.netRBTC).to.equal(expectedNet(E("5")).net);
+     });
+-  });
+-
+-  // ── 2. Funding ─────────────────────────────────────────────────────────────
+-  describe("Funding", function () {
+-
+-    it("accepts RBTC via direct send and emits Funded", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      const topUp  = ethers.parseEther("0.5");
+-      const before = await gasStation.rbtcReserve();
+ 
+-      await expect(
+-        owner.sendTransaction({ to: await gasStation.getAddress(), value: topUp })
+-      ).to.emit(gasStation, "Funded").withArgs(owner.address, topUp);
+-
+-      expect(await gasStation.rbtcReserve()).to.equal(before + topUp);
++    it("reports why a swap is not allowed", async function () {
++      const { station, usdrif, user, other } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      expect((await station.previewSwap(t, E("1"), user.address))[1]).to.equal(S.BELOW_MIN_SWAP);
++      expect((await station.previewSwap(t, E("11"), user.address))[1]).to.equal(S.ABOVE_MAX_SWAP);
++      expect((await station.previewSwap(other.address, E("5"), user.address))[1]).to.equal(S.TOKEN_NOT_ENABLED);
+     });
+-  });
+-
+-  // ── 3. quoteRBTCOut ────────────────────────────────────────────────────────
+-  describe("quoteRBTCOut", function () {
+ 
+-    it("returns correct RBTC out and fee for USDRIF", async function () {
+-      const { gasStation, usdrif } = await loadFixture(deployFixture);
+-
+-      const [rbtcOut, feeRBTC] = await gasStation.quoteRBTCOut(
+-        await usdrif.getAddress(), USDRIF_AMOUNT_IN
+-      );
+-
+-      const gross       = (USDRIF_AMOUNT_IN * ethers.parseEther("1")) / USDRIF_PER_RBTC;
+-      const expectedFee = (gross * FEE_BPS) / 10_000n;
+-      const expectedOut = gross - expectedFee;
+-
+-      expect(feeRBTC).to.equal(expectedFee);
+-      expect(rbtcOut).to.equal(expectedOut);
++    it("reports AMOUNT_TOO_SMALL when the gas fee eats the whole amount", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      await station.setGasRecoveryFee(E("3"));
++      expect((await station.previewSwap(await usdrif.getAddress(), E("2"), user.address))[1]).to.equal(S.AMOUNT_TOO_SMALL);
+     });
+ 
+-    it("returns correct RBTC out and fee for RIF", async function () {
+-      const { gasStation, rif } = await loadFixture(deployFixture);
+-
+-      const [rbtcOut, feeRBTC] = await gasStation.quoteRBTCOut(
+-        await rif.getAddress(), RIF_AMOUNT_IN
+-      );
+-
+-      const gross       = (RIF_AMOUNT_IN * ethers.parseEther("1")) / RIF_PER_RBTC;
+-      const expectedFee = (gross * FEE_BPS) / 10_000n;
+-      const expectedOut = gross - expectedFee;
+-
+-      expect(feeRBTC).to.equal(expectedFee);
+-      expect(rbtcOut).to.equal(expectedOut);
++    it("reports PRICE_STALE once the oldest price is older than maxPriceAge", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      await time.increase(3601);
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.PRICE_STALE);
+     });
+ 
+-    it("reverts for unsupported token", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      await expect(
+-        gasStation.quoteRBTCOut(ethers.ZeroAddress, 1n)
+-      ).to.be.revertedWith("GasStation: unsupported token");
++    it("reports PAUSED", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      await station.pause();
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.PAUSED);
+     });
+   });
+ 
+-  // ── 4. quoteTokenIn ────────────────────────────────────────────────────────
+-  describe("quoteTokenIn", function () {
+-
+-    it("returns correct USDRIF needed for desired RBTC", async function () {
+-      const { gasStation, usdrif } = await loadFixture(deployFixture);
+-      const wantRBTC  = ethers.parseEther("0.00005");
+-      const tokenIn   = await gasStation.quoteTokenIn(await usdrif.getAddress(), wantRBTC);
+-      const grossRBTC = (wantRBTC * 10_000n) / (10_000n - FEE_BPS);
+-      const expected  = (grossRBTC * USDRIF_PER_RBTC) / ethers.parseEther("1");
+-      expect(tokenIn).to.equal(expected);
+-    });
+-
+-    it("reverts for unsupported token", async function () {
+-      const { gasStation } = await loadFixture(deployFixture);
+-      await expect(
+-        gasStation.quoteTokenIn(ethers.ZeroAddress, 1n)
+-      ).to.be.revertedWith("GasStation: unsupported token");
++  describe("swap", function () {
++    it("pays RBTC, takes tokens, and emits Swapped", async function () {
++      const { station, usdrif, user, stationAddr } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      const e = expectedNet(E("5"));
++      const tx = station.connect(user).swap(t, E("5"), e.net, await deadline());
++      await expect(tx).to.changeEtherBalance(user, e.net);
++      await expect(tx).to.changeTokenBalances(usdrif, [user, stationAddr], [-E("5"), E("5")]);
++      await expect(tx).to.emit(station, "Swapped").withArgs(user.address, t, E("5"), e.net, e.gas, e.spread, BTC_USD, E("1"));
++    });
++
++    it("pays exactly what previewSwap said (same code path)", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      for (const amt of ["2", "3.3", "7.77", "10"]) {
++        const [q] = await station.previewSwap(t, E(amt), user.address);
++        await time.increase(86400); // new day so caps reset; refresh price age
++        await (await ethers.getContractAt("BoundedManualPriceSource", await station.btcPriceSource())).setPrice(BTC_USD);
++        await station.checkpointPrices();
++        const [q2] = await station.previewSwap(t, E(amt), user.address);
++        expect(q2.netRBTC).to.equal(q.netRBTC);
++        await expect(station.connect(user).swap(t, E(amt), q2.netRBTC, await deadline())).to.changeEtherBalance(user, q2.netRBTC);
++      }
++    });
++
++    it("reverts on slippage and on an expired deadline", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      const e = expectedNet(E("5"));
++      await expect(station.connect(user).swap(t, E("5"), e.net + 1n, await deadline()))
++        .to.be.revertedWithCustomError(station, "Slippage").withArgs(e.net, e.net + 1n);
++      await expect(station.connect(user).swap(t, E("5"), 0, (await time.latest()) - 1))
++        .to.be.revertedWithCustomError(station, "Expired");
++    });
++
++    it("reverts with SwapNotAllowed for each failing status", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      await expect(station.connect(user).swap(t, E("1"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "SwapNotAllowed").withArgs(S.BELOW_MIN_SWAP);
++      await expect(station.connect(user).swap(t, E("11"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "SwapNotAllowed").withArgs(S.ABOVE_MAX_SWAP);
++    });
++
++    it("enforces the per-address daily cap and resets next day", async function () {
++      const { station, usdrif, user, btcSrc } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      await station.connect(user).swap(t, E("6"), 0, await deadline());
++      await expect(station.connect(user).swap(t, E("5"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "SwapNotAllowed").withArgs(S.USER_DAILY_CAP);
++      await time.increase(86400);
++      await btcSrc.setPrice(BTC_USD);
++      await expect(station.connect(user).swap(t, E("5"), 0, await deadline())).to.not.be.reverted;
++    });
++
++    it("enforces the global daily outflow cap across users", async function () {
++      const { station, usdrif, user, user2 } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      await station.setLimits(E("2"), E("10"), E("10"), E("0.0001"), E("0.0001")); // ~ $8 per day total
++      await station.connect(user).swap(t, E("7"), 0, await deadline());
++      await expect(station.connect(user2).swap(t, E("7"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "SwapNotAllowed").withArgs(S.GLOBAL_DAILY_CAP);
++    });
++
++    it("never lets the reserve fall below the floor", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      await station.setLimits(E("2"), E("10"), E("10"), E("0.001"), E("0.00999"));
++      await expect(station.connect(user).swap(t, E("10"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "SwapNotAllowed").withArgs(S.RESERVE_FLOOR);
++    });
++
++    it("rejects fee-on-transfer tokens", async function () {
++      const { owner, user, station, stationAddr, usdSrc } = await loadFixture(deployFixture);
++      const Fee = await ethers.getContractFactory("MockFeeToken");
++      const fee = await Fee.deploy();
++      await fee.mint(user.address, E("100"));
++      await fee.connect(user).approve(stationAddr, ethers.MaxUint256);
++      await station.connect(owner).setToken(await fee.getAddress(), await usdSrc.getAddress(), SPREAD_BPS, true);
++      await expect(station.connect(user).swap(await fee.getAddress(), E("5"), 0, await deadline()))
++        .to.be.revertedWithCustomError(station, "UnexpectedTokenBalance");
++    });
++
++    it("blocks re-entrancy from the receive hook", async function () {
++      const { station, usdrif, stationAddr, user } = await loadFixture(deployFixture);
++      const R = await ethers.getContractFactory("ReentrantReceiver");
++      const r = await R.deploy(stationAddr, await usdrif.getAddress());
++      await usdrif.mint(await r.getAddress(), E("50"));
++      await expect(r.attack(E("5"))).to.be.revertedWithCustomError(station, "RBTCTransferFailed");
++      expect(await ethers.provider.getBalance(await r.getAddress())).to.equal(0);
++      void user;
+     });
+   });
+ 
+-  // ── 5. swapUSDRIFForRBTC ───────────────────────────────────────────────────
+-  describe("swapUSDRIFForRBTC", function () {
+-
+-    it("sends RBTC to user and collects USDRIF", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-
+-      const [rbtcOut] = await gasStation.quoteRBTCOut(
+-        await usdrif.getAddress(), USDRIF_AMOUNT_IN
+-      );
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      const balBefore = await ethers.provider.getBalance(user.address);
+-      const tx        = await gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n);
+-      const receipt   = await tx.wait();
+-      const gasUsed   = receipt!.gasUsed * receipt!.gasPrice;
+-      const balAfter  = await ethers.provider.getBalance(user.address);
+-
+-      expect(balAfter).to.equal(balBefore + rbtcOut - gasUsed);
+-      expect(await gasStation.tokenBalance(await usdrif.getAddress())).to.equal(USDRIF_AMOUNT_IN);
+-    });
+-
+-    it("emits Swapped event", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n)
+-      ).to.emit(gasStation, "Swapped");
+-    });
+-
+-    it("reverts on zero input", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), 1000n);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(0n, 0n)
+-      ).to.be.revertedWith("GasStation: zero input");
+-    });
+-
+-    it("reverts when slippage exceeded", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, ethers.parseEther("999"))
+-      ).to.be.revertedWith("GasStation: slippage exceeded");
+-    });
+-
+-    it("reverts when paused", async function () {
+-      const { gasStation, usdrif, user, owner } = await loadFixture(deployFixture);
+-      await gasStation.connect(owner).setPaused(true);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n)
+-      ).to.be.revertedWith("GasStation: paused");
+-    });
+-
+-    it("reverts when RBTC reserve is empty", async function () {
+-      const { gasStation, usdrif, user, owner } = await loadFixture(deployFixture);
+-
+-      // Drain reserve
+-      await gasStation.connect(owner).withdrawRBTC(SEED_RBTC);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n)
+-      ).to.be.revertedWith("GasStation: insufficient RBTC reserve");
+-    });
+-
+-    it("reverts when output below minRBTCOut", async function () {
+-      const { gasStation, usdrif, user, owner } = await loadFixture(deployFixture);
+-
+-      // Set min very high
+-      await gasStation.connect(owner).setLimits(
+-        ethers.parseEther("100"),
+-        ethers.parseEther("200")
+-      );
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n)
+-      ).to.be.revertedWith("GasStation: below min output");
+-    });
+-
+-    it("reverts when output above maxRBTCOut", async function () {
+-      const { gasStation, usdrif, user, owner } = await loadFixture(deployFixture);
+-
+-      // Set max very low
+-      await gasStation.connect(owner).setLimits(
+-        ethers.parseEther("0.000000001"),
+-        ethers.parseEther("0.000000001")
+-      );
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n)
+-      ).to.be.revertedWith("GasStation: above max output");
++  describe("price sources", function () {
++    it("MoCPriceSource reads the oracle and rejects an invalid one", async function () {
++      const Oracle = await ethers.getContractFactory("MockPriceOracle");
++      const oracle = await Oracle.deploy(E("80000"));
++      const Moc = await ethers.getContractFactory("MoCPriceSource");
++      const src = await Moc.deploy(await oracle.getAddress());
++      expect((await src.getPrice())[0]).to.equal(E("80000"));
++      await oracle.setValid(false);
++      await expect(src.getPrice()).to.be.revertedWith("MoCPriceSource: oracle invalid");
++    });
++
++    it("station reports PRICE_UNAVAILABLE when the oracle goes invalid", async function () {
++      const { owner, station, usdrif, user } = await loadFixture(deployFixture);
++      const Oracle = await ethers.getContractFactory("MockPriceOracle");
++      const oracle = await Oracle.deploy(E("80000"));
++      const Moc = await ethers.getContractFactory("MoCPriceSource");
++      const src = await Moc.deploy(await oracle.getAddress());
++      await station.connect(owner).setBtcPriceSource(await src.getAddress());
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.OK);
++      await oracle.setValid(false);
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.PRICE_UNAVAILABLE);
++    });
++
++    it("BoundedManualPriceSource limits the updater but not the owner", async function () {
++      const { btcSrc, other } = await loadFixture(deployFixture);
++      await btcSrc.setUpdater(other.address);
++      await expect(btcSrc.connect(other).setPrice(E("90000"))).to.be.revertedWith("ManualSource: step too large");
++      await expect(btcSrc.connect(other).setPrice(E("82000"))).to.not.be.reverted;
++      await expect(btcSrc.setPrice(E("120000"))).to.not.be.reverted; // owner is unbounded
++      await expect(btcSrc.connect((await ethers.getSigners())[7]).setPrice(E("1"))).to.be.revertedWith("ManualSource: not authorized");
+     });
+   });
+ 
+-  // ── 6. swapRIFForRBTC ─────────────────────────────────────────────────────
+-  describe("swapRIFForRBTC", function () {
++  describe("circuit breaker", function () {
++    it("trips persistently on a big move, blocks swaps, and can be reset", async function () {
++      const { station, btcSrc, usdrif, user } = await loadFixture(deployFixture);
++      await btcSrc.setPrice(E("100000")); // +25%
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.PRICE_DEVIATION);
+ 
+-    it("sends RBTC to user and collects RIF", async function () {
+-      const { gasStation, rif, user } = await loadFixture(deployFixture);
++      await expect(station.checkpointPrices()).to.emit(station, "BreakerTripped").withArgs(BTC_USD, E("100000"));
++      expect(await station.breakerTripped()).to.equal(true);
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.BREAKER_TRIPPED);
+ 
+-      const [rbtcOut] = await gasStation.quoteRBTCOut(
+-        await rif.getAddress(), RIF_AMOUNT_IN
+-      );
+-
+-      await rif.connect(user).approve(await gasStation.getAddress(), RIF_AMOUNT_IN);
+-
+-      const balBefore = await ethers.provider.getBalance(user.address);
+-      const tx        = await gasStation.connect(user).swapRIFForRBTC(RIF_AMOUNT_IN, 0n);
+-      const receipt   = await tx.wait();
+-      const gasUsed   = receipt!.gasUsed * receipt!.gasPrice;
+-      const balAfter  = await ethers.provider.getBalance(user.address);
+-
+-      expect(balAfter).to.equal(balBefore + rbtcOut - gasUsed);
++      await expect(station.resetBreaker()).to.emit(station, "BreakerReset").withArgs(E("100000"));
++      expect((await station.previewSwap(await usdrif.getAddress(), E("5"), user.address))[1]).to.equal(S.OK);
+     });
+ 
+-    it("emits Swapped event", async function () {
+-      const { gasStation, rif, user } = await loadFixture(deployFixture);
+-
+-      await rif.connect(user).approve(await gasStation.getAddress(), RIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapRIFForRBTC(RIF_AMOUNT_IN, 0n)
+-      ).to.emit(gasStation, "Swapped");
+-    });
+-
+-    it("reverts on zero input", async function () {
+-      const { gasStation, rif, user } = await loadFixture(deployFixture);
+-      await rif.connect(user).approve(await gasStation.getAddress(), 1000n);
+-
+-      await expect(
+-        gasStation.connect(user).swapRIFForRBTC(0n, 0n)
+-      ).to.be.revertedWith("GasStation: zero input");
+-    });
+-
+-    it("reverts when paused", async function () {
+-      const { gasStation, rif, user, owner } = await loadFixture(deployFixture);
+-      await gasStation.connect(owner).setPaused(true);
+-
+-      await rif.connect(user).approve(await gasStation.getAddress(), RIF_AMOUNT_IN);
+-
+-      await expect(
+-        gasStation.connect(user).swapRIFForRBTC(RIF_AMOUNT_IN, 0n)
+-      ).to.be.revertedWith("GasStation: paused");
++    it("moves the baseline forward on small moves", async function () {
++      const { station, btcSrc } = await loadFixture(deployFixture);
++      await btcSrc.setPrice(E("84000")); // +5%
++      await expect(station.checkpointPrices()).to.emit(station, "Checkpoint").withArgs(E("84000"));
++      expect(await station.baselineBtcPriceUsd()).to.equal(E("84000"));
+     });
+   });
+ 
+-  // ── 7. Admin ──────────────────────────────────────────────────────────────
+-  describe("Admin", function () {
+-
+-    it("owner can update USDRIF rate and emits RateUpdated", async function () {
+-      const { gasStation, usdrif, owner } = await loadFixture(deployFixture);
+-      const newRate = 4000n * 10n ** 18n;
+-
+-      await expect(gasStation.connect(owner).setUSDRIFRate(newRate))
+-        .to.emit(gasStation, "RateUpdated")
+-        .withArgs(await usdrif.getAddress(), newRate);
+-
+-      expect(await gasStation.usdrifPerRBTC()).to.equal(newRate);
+-    });
+-
+-    it("owner can update RIF rate and emits RateUpdated", async function () {
+-      const { gasStation, rif, owner } = await loadFixture(deployFixture);
+-      const newRate = 2000n * 10n ** 18n;
+-
+-      await expect(gasStation.connect(owner).setRIFRate(newRate))
+-        .to.emit(gasStation, "RateUpdated")
+-        .withArgs(await rif.getAddress(), newRate);
+-
+-      expect(await gasStation.rifPerRBTC()).to.equal(newRate);
+-    });
+-
+-    it("owner can update fee", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      await gasStation.connect(owner).setFeeBps(100);
+-      expect(await gasStation.feeBps()).to.equal(100);
++  describe("admin and roles", function () {
++    it("lets the guardian pause but only the owner unpause", async function () {
++      const { station, guardian } = await loadFixture(deployFixture);
++      await station.setGuardian(guardian.address);
++      await station.connect(guardian).pause();
++      expect(await station.paused()).to.equal(true);
++      await expect(station.connect(guardian).unpause()).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await station.unpause();
++      expect(await station.paused()).to.equal(false);
+     });
+ 
+-    it("owner can pause and unpause", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-
+-      await expect(gasStation.connect(owner).setPaused(true))
+-        .to.emit(gasStation, "PausedSet").withArgs(true);
+-      expect(await gasStation.paused()).to.equal(true);
+-
+-      await gasStation.connect(owner).setPaused(false);
+-      expect(await gasStation.paused()).to.equal(false);
++    it("uses two-step ownership", async function () {
++      const { station, other, owner } = await loadFixture(deployFixture);
++      await station.transferOwnership(other.address);
++      expect(await station.owner()).to.equal(owner.address);
++      await station.connect(other).acceptOwnership();
++      expect(await station.owner()).to.equal(other.address);
+     });
+ 
+-    it("owner can withdraw collected tokens", async function () {
+-      const { gasStation, usdrif, user, owner } = await loadFixture(deployFixture);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-      await gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n);
+-
+-      const ownerBalBefore = await usdrif.balanceOf(owner.address);
+-      await gasStation.connect(owner).withdrawTokens(await usdrif.getAddress(), USDRIF_AMOUNT_IN);
+-      expect(await usdrif.balanceOf(owner.address)).to.equal(ownerBalBefore + USDRIF_AMOUNT_IN);
++    it("restricts admin functions to the owner", async function () {
++      const { station, other, usdrif, usdSrc } = await loadFixture(deployFixture);
++      const s = station.connect(other);
++      await expect(s.setToken(await usdrif.getAddress(), await usdSrc.getAddress(), 1, true)).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.setLimits(1, 2, 2, 1, 0)).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.setGasRecoveryFee(1)).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.setPriceGuards(1, 1)).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.withdrawRBTC(1)).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.resetBreaker()).to.be.revertedWithCustomError(station, "OwnableUnauthorizedAccount");
++      await expect(s.pause()).to.be.revertedWith("GasStation: not authorized");
+     });
+ 
+-    it("owner can withdraw RBTC", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      const amount = ethers.parseEther("0.1");
+-
+-      const balBefore = await ethers.provider.getBalance(owner.address);
+-      const tx        = await gasStation.connect(owner).withdrawRBTC(amount);
+-      const receipt   = await tx.wait();
+-      const gasUsed   = receipt!.gasUsed * receipt!.gasPrice;
+-      const balAfter  = await ethers.provider.getBalance(owner.address);
+-
+-      expect(balAfter).to.equal(balBefore + amount - gasUsed);
++    it("validates token configuration", async function () {
++      const { station, usdrif, other } = await loadFixture(deployFixture);
++      await expect(station.setToken(await usdrif.getAddress(), other.address, 50, true)).to.be.revertedWith("GasStation: source not a contract");
++      await expect(station.setToken(ethers.ZeroAddress, await station.btcPriceSource(), 50, true)).to.be.revertedWith("GasStation: zero token");
++      await expect(station.setToken(await usdrif.getAddress(), await station.btcPriceSource(), 1001, true)).to.be.revertedWith("GasStation: spread too high");
+     });
+ 
+-    it("owner can transfer ownership", async function () {
+-      const { gasStation, owner, other } = await loadFixture(deployFixture);
+-
+-      await expect(gasStation.connect(owner).transferOwnership(other.address))
+-        .to.emit(gasStation, "OwnershipTransferred")
+-        .withArgs(owner.address, other.address);
+-
+-      expect(await gasStation.owner()).to.equal(other.address);
++    it("can disable a token", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      const t = await usdrif.getAddress();
++      const cfg = await station.tokens(t);
++      await station.setToken(t, cfg.priceSource, cfg.spreadBps, false);
++      expect((await station.previewSwap(t, E("5"), user.address))[1]).to.equal(S.TOKEN_NOT_ENABLED);
+     });
+ 
+-    it("non-owner cannot set USDRIF rate", async function () {
+-      const { gasStation, user } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(user).setUSDRIFRate(1n))
+-        .to.be.revertedWith("GasStation: not owner");
++    it("lets the owner withdraw tokens and RBTC", async function () {
++      const { station, usdrif, user, owner } = await loadFixture(deployFixture);
++      await station.connect(user).swap(await usdrif.getAddress(), E("5"), 0, await deadline());
++      await expect(station.withdrawTokens(await usdrif.getAddress(), E("5"))).to.changeTokenBalance(usdrif, owner, E("5"));
++      await expect(station.withdrawRBTC(E("0.001"))).to.changeEtherBalance(owner, E("0.001"));
++      await expect(station.withdrawRBTC(E("10"))).to.be.revertedWith("GasStation: insufficient balance");
+     });
+ 
+-    it("non-owner cannot set RIF rate", async function () {
+-      const { gasStation, user } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(user).setRIFRate(1n))
+-        .to.be.revertedWith("GasStation: not owner");
+-    });
+-
+-    it("non-owner cannot pause", async function () {
+-      const { gasStation, user } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(user).setPaused(true))
+-        .to.be.revertedWith("GasStation: not owner");
+-    });
+-
+-    it("non-owner cannot withdraw RBTC", async function () {
+-      const { gasStation, user } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(user).withdrawRBTC(1n))
+-        .to.be.revertedWith("GasStation: not owner");
+-    });
+-
+-    it("non-owner cannot withdraw tokens", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-      await expect(
+-        gasStation.connect(user).withdrawTokens(await usdrif.getAddress(), 1n)
+-      ).to.be.revertedWith("GasStation: not owner");
+-    });
+-
+-    it("non-owner cannot transfer ownership", async function () {
+-      const { gasStation, user, other } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(user).transferOwnership(other.address))
+-        .to.be.revertedWith("GasStation: not owner");
+-    });
+-
+-    it("reverts transferOwnership to zero address", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(owner).transferOwnership(ethers.ZeroAddress))
+-        .to.be.revertedWith("GasStation: zero address");
+-    });
+-
+-    it("reverts setFeeBps >= 100%", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      await expect(gasStation.connect(owner).setFeeBps(10_000))
+-        .to.be.revertedWith("GasStation: fee >= 100%");
+-    });
+-
+-    it("reverts setLimits when min > max", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      await expect(
+-        gasStation.connect(owner).setLimits(ethers.parseEther("1"), ethers.parseEther("0.1"))
+-      ).to.be.revertedWith("GasStation: min > max");
+-    });
+-
+-    it("reverts withdrawRBTC when amount exceeds balance", async function () {
+-      const { gasStation, owner } = await loadFixture(deployFixture);
+-      await expect(
+-        gasStation.connect(owner).withdrawRBTC(ethers.parseEther("999"))
+-      ).to.be.revertedWith("GasStation: insufficient balance");
++    it("accepts direct funding and emits Funded", async function () {
++      const { station, stationAddr, other } = await loadFixture(deployFixture);
++      await expect(other.sendTransaction({ to: stationAddr, value: E("0.001") })).to.emit(station, "Funded").withArgs(other.address, E("0.001"));
+     });
+   });
+ 
+-  // ── 8. tokenBalance ────────────────────────────────────────────────────────
+-  describe("tokenBalance", function () {
+-
+-    it("returns zero before any swap", async function () {
+-      const { gasStation, usdrif } = await loadFixture(deployFixture);
+-      expect(await gasStation.tokenBalance(await usdrif.getAddress())).to.equal(0n);
+-    });
+-
+-    it("returns correct balance after swap", async function () {
+-      const { gasStation, usdrif, user } = await loadFixture(deployFixture);
+-
+-      await usdrif.connect(user).approve(await gasStation.getAddress(), USDRIF_AMOUNT_IN);
+-      await gasStation.connect(user).swapUSDRIFForRBTC(USDRIF_AMOUNT_IN, 0n);
+-
+-      expect(await gasStation.tokenBalance(await usdrif.getAddress())).to.equal(USDRIF_AMOUNT_IN);
++  describe("remainingAllowance", function () {
++    it("shrinks as the user swaps", async function () {
++      const { station, usdrif, user } = await loadFixture(deployFixture);
++      let [u, g, r] = await station.remainingAllowance(user.address);
++      expect(u).to.equal(E("10"));
++      expect(g).to.equal(E("0.001"));
++      expect(r).to.equal(E("0.01") - E("0.0001"));
++      await station.connect(user).swap(await usdrif.getAddress(), E("4"), 0, await deadline());
++      [u, g] = await station.remainingAllowance(user.address);
++      expect(u).to.equal(E("6"));
++      expect(g).to.be.lt(E("0.001"));
+     });
+   });
+-});
+\ No newline at end of file
++});

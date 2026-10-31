@@ -1,4 +1,4 @@
-import { ethers } from "hardhat";
+import { ethers, network } from "hardhat";
 
 async function main() {
   const [deployer] = await ethers.getSigners();
@@ -20,8 +20,23 @@ async function main() {
   // guess an address). Leave as ethers.ZeroAddress to start a token in
   // manual-rate mode instead (useful on testnet, or if no feed exists yet
   // for that token, e.g. RIF/stRIF pairs that don't have oracle coverage).
-  const USDRIF_PRICE_FEED = ethers.ZeroAddress; // TODO: wire in real feed before mainnet
-  const RIF_PRICE_FEED    = ethers.ZeroAddress; // TODO: wire in real feed before mainnet
+  // Confirmed via MoC docs (money-on-chain/price_oracle_interfaces README) — Oct 2026.
+  // Re-verify on Blockscout before mainnet deploy; addresses can change between networks.
+  const IS_MAINNET = network.name === "rskMainnet"; // adjust to match your hardhat.config network name
+
+  const USDRIF_PRICE_FEED = IS_MAINNET
+    ? "0xa5A9874559936B32CDE23591e6E7533d665118F2"   // PriceProviderUsdRifUsd — mainnet
+    : "0x6Ca13A1050Dddcc507D615Fd2306F591834D7Cdc";  // PriceProviderUsdRifUsd — testnet
+
+  // No confirmed on-chain RIF/USD feed was found from MoC — only USDRIF/USD exists
+  // in their published docs. Leaving this in manual mode rather than wiring a feed
+  // that doesn't actually price RIF. Two real options, pick one before mainnet:
+  //   (a) if rifToken is actually meant to BE USDRIF, deploy with the same
+  //       USDRIF_PRICE_FEED address for both legs, or
+  //   (b) keep RIF in manual mode and say so plainly in the demo — "RIF rate uses
+  //       a manually-configured fallback; USDRIF rate is fully on-chain via MoC."
+  // Do not wire a BTC/USD feed here and call it "the RIF price" — it isn't.
+  const RIF_PRICE_FEED = ethers.ZeroAddress;
 
   // Manual fallback rates — used only while the corresponding oracle is disabled.
   const MANUAL_USDRIF_PER_RBTC = 3000n * 10n ** 18n;
