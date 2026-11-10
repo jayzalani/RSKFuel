@@ -2,30 +2,25 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /**
  * @title RBTCGasStation
  * @notice Pre-funded RBTC Gas Station on Rootstock.
- *         Users pay with USDRIF or RIF and receive RBTC instantly, priced
- *         off a live on-chain oracle instead of an owner-set manual rate.
+ *         Users pay with USDRIF or RIF and receive RBTC instantly.
+ *
+ *         Two ways to swap:
+ *          - swapWithQuote(): executes at a live-rate quote signed by `quoteSigner`
+ *            (fees already deducted off-chain). This is what the frontend uses.
+ *          - swapUSDRIFForRBTC / swapRIFForRBTC: legacy path priced from the
+ *            on-chain oracle / keeper rate.
  *
  * @dev PRICE FEED CONVENTION — READ BEFORE DEPLOYING WITH REAL FUNDS:
  *      Each price feed passed in here MUST return, via peek(), "how many
- *      token-wei the user must pay per 1 RBTC-wei", scaled to 1e18 — the
- *      exact same units the old manual `usdrifPerRBTC` / `rifPerRBTC`
- *      variables used.
- *
- *      Most RSK oracles (e.g. Money On Chain's IMoCBaseOracle) publish a
- *      USD/BTC price, not a token-per-RBTC price directly. So:
- *        - For a USD-pegged token (USDRIF, if it holds ~$1), an RBTC/USD
- *          feed's price IS approximately your usdrifPerRBTC rate.
- *        - For a non-USD-pegged token (RIF), you will likely need a small
- *          adapter contract that combines an RBTC/USD feed and a RIF/USD
- *          feed into a single "RIF per RBTC" cross-rate, then implements
- *          this same peek() interface so it can be dropped in below.
- *      Verify the exact units/decimals of whatever real feed address you
- *      wire in against ITS OWN docs before mainnet. A unit mismatch here
- *      mispricess every swap with real money.
+ *      token-wei the user must pay per 1 RBTC-wei", scaled to 1e18.
+ *      For RIF you need a cross-rate adapter (BTC/USD ÷ RIF/USD); a raw
+ *      BTC/USD feed would misprice RIF.
  */
 
 interface IERC20 {
@@ -37,15 +32,10 @@ interface IERC20 {
 
 /// @dev Standard interface used by Money On Chain / most RSK price oracles.
 interface IMoCBaseOracle {
-    /// @return price Latest price, bytes32-encoded uint256, 1e18-scaled.
-    /// @return valid False if the oracle itself considers this reading
-    ///                stale or unreliable — callers MUST treat valid ==
-    ///                false as "no usable price right now", never fall
-    ///                back to it silently.
     function peek() external view returns (bytes32 price, bool valid);
 }
 
-contract RBTCGasStation is ReentrancyGuard {
+contract RBTCGasStation is ReentrancyGuard, EIP712 {
     // ── State ────────────────────────────────────────────────────────────────
 
     address public owner;
@@ -53,25 +43,17 @@ contract RBTCGasStation is ReentrancyGuard {
     address public usdrifToken;
     address public rifToken;
 
-    /// @notice Live oracle feeds. address(0) means "no oracle wired up for this token".
     IMoCBaseOracle public usdrifPriceFeed;
     IMoCBaseOracle public rifPriceFeed;
 
-    /// @notice Emergency manual fallback rate — only used while that token's
-    /// oracle mode is switched off. Same units as before: token-wei per 1 RBTC-wei.
     uint256 public manualUsdrifPerRBTC;
     uint256 public manualRifPerRBTC;
 
     bool public usdrifOracleEnabled;
     bool public rifOracleEnabled;
 
-    /// @notice Circuit breaker: max allowed move (in bps) between the last
-    /// rate this contract actually used and a fresh oracle reading, before
-    /// swaps for that token pause and wait for owner review.
-    uint256 public maxDeviationBps = 1000; // 10% default — tune before mainnet
+    uint256 public maxDeviationBps = 1000; // 10%
 
-    /// @notice Last rate actually used to price a swap, per token (circuit
-    /// breaker baseline).
     uint256 public lastUsdrifRate;
     uint256 public lastRifRate;
 
@@ -81,11 +63,27 @@ contract RBTCGasStation is ReentrancyGuard {
 
     bool public paused;
 
-    /// @notice A separate, lower-privilege address allowed to push rate
-    /// updates (e.g. an automated price-keeper bot). Deliberately CANNOT
-    /// withdraw funds, change fees, or do anything owner can — limits the
-    /// blast radius of a key that has to live on an always-running server.
     address public priceUpdater;
+
+    // ── Signed-quote state ───────────────────────────────────────────────────
+
+    struct Quote {
+        address token;
+        uint256 tokenAmountIn;
+        uint256 rbtcOut; // exactly what the user receives (fees already deducted off-chain)
+        uint256 deadline;
+        bytes32 nonce;
+    }
+
+    bytes32 private constant QUOTE_TYPEHASH = keccak256(
+        "Quote(address user,address token,uint256 tokenAmountIn,uint256 rbtcOut,uint256 deadline,bytes32 nonce)"
+    );
+
+    address public quoteSigner;
+    /// @notice A signed quote may pay out at most this much more than the on-chain
+    /// reference rate implies. Caps the damage if the signer key is compromised.
+    uint256 public maxQuoteDeviationBps = 500; // 5%
+    mapping(bytes32 => bool) public usedQuoteNonces;
 
     // ── Events ───────────────────────────────────────────────────────────────
 
@@ -100,6 +98,7 @@ contract RBTCGasStation is ReentrancyGuard {
     event PausedSet(bool paused);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
     event PriceUpdaterChanged(address indexed oldUpdater, address indexed newUpdater);
+    event QuoteSignerUpdated(address indexed signer);
 
     // ── Modifiers ────────────────────────────────────────────────────────────
 
@@ -120,17 +119,6 @@ contract RBTCGasStation is ReentrancyGuard {
 
     // ── Constructor ──────────────────────────────────────────────────────────
 
-    /**
-     * @param _usdrifToken        USDRIF token contract address
-     * @param _rifToken           RIF token contract address
-     * @param _usdrifPriceFeed    IMoCBaseOracle-compatible feed for USDRIF, or address(0) to start in manual mode
-     * @param _rifPriceFeed       IMoCBaseOracle-compatible feed for RIF, or address(0) to start in manual mode
-     * @param _manualUsdrifPerRBTC  Fallback rate used only if oracle is off/unset
-     * @param _manualRifPerRBTC     Fallback rate used only if oracle is off/unset
-     * @param _feeBps             Swap fee in basis points (e.g. 50 = 0.5%)
-     * @param _minRBTCOut         Minimum RBTC out per swap (wei)
-     * @param _maxRBTCOut         Maximum RBTC out per swap (wei)
-     */
     constructor(
         address _usdrifToken,
         address _rifToken,
@@ -141,7 +129,7 @@ contract RBTCGasStation is ReentrancyGuard {
         uint256 _feeBps,
         uint256 _minRBTCOut,
         uint256 _maxRBTCOut
-    ) {
+    ) EIP712("RBTCGasStation", "1") {
         require(_usdrifToken != address(0), "GasStation: zero usdrif addr");
         require(_rifToken != address(0), "GasStation: zero rif addr");
         require(_feeBps < 10_000, "GasStation: fee >= 100%");
@@ -176,7 +164,7 @@ contract RBTCGasStation is ReentrancyGuard {
         emit Funded(msg.sender, msg.value);
     }
 
-    // ── Core Swap ────────────────────────────────────────────────────────────
+    // ── Core Swap (legacy, on-chain-rate path) ───────────────────────────────
 
     function swapUSDRIFForRBTC(uint256 tokenAmountIn, uint256 minRBTCExpected)
         external
@@ -198,11 +186,51 @@ contract RBTCGasStation is ReentrancyGuard {
         _swap(rifToken, rate, tokenAmountIn, minRBTCExpected);
     }
 
+    // ── Signed live-rate quotes ──────────────────────────────────────────────
+
+    function swapWithQuote(Quote calldata q, bytes calldata sig) external whenNotPaused nonReentrant {
+        _verifyQuote(q, sig);
+        _executeQuote(q);
+    }
+
+    function _verifyQuote(Quote calldata q, bytes calldata sig) internal {
+        require(quoteSigner != address(0), "GasStation: quotes disabled");
+        require(block.timestamp <= q.deadline, "GasStation: quote expired");
+        require(!usedQuoteNonces[q.nonce], "GasStation: quote already used");
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(abi.encode(QUOTE_TYPEHASH, msg.sender, q.token, q.tokenAmountIn, q.rbtcOut, q.deadline, q.nonce))
+        );
+        require(ECDSA.recover(digest, sig) == quoteSigner, "GasStation: bad quote signature");
+        usedQuoteNonces[q.nonce] = true;
+    }
+
+    function _executeQuote(Quote calldata q) internal {
+        require(q.tokenAmountIn > 0, "GasStation: zero input");
+        uint256 rate = _rateFor(q.token); // 0 for unsupported tokens
+        require(rate > 0, "GasStation: unsupported token");
+
+        // Sanity band against the on-chain reference rate (keeper/oracle must stay fresh).
+        uint256 refOut = (q.tokenAmountIn * 1 ether) / rate;
+        require(
+            q.rbtcOut <= (refOut * (10_000 + maxQuoteDeviationBps)) / 10_000,
+            "GasStation: quote outside on-chain rate band"
+        );
+
+        require(q.rbtcOut >= minRBTCOut, "GasStation: below min output");
+        require(q.rbtcOut <= maxRBTCOut, "GasStation: above max output");
+        require(address(this).balance >= q.rbtcOut, "GasStation: insufficient RBTC reserve");
+
+        bool ok = IERC20(q.token).transferFrom(msg.sender, address(this), q.tokenAmountIn);
+        require(ok, "GasStation: token transfer failed");
+
+        (bool sent, ) = payable(msg.sender).call{value: q.rbtcOut}("");
+        require(sent, "GasStation: RBTC send failed");
+
+        emit Swapped(msg.sender, q.token, q.tokenAmountIn, q.rbtcOut, refOut > q.rbtcOut ? refOut - q.rbtcOut : 0);
+    }
+
     // ── Oracle resolution + circuit breaker ─────────────────────────────────
 
-    /// @dev Resolves the current rate for a token, either from its oracle
-    /// (with staleness + deviation checks) or the manual fallback if oracle
-    /// mode is off. Reverts rather than ever silently swapping at a bad price.
     function _resolveRate(
         IMoCBaseOracle feed,
         bool oracleEnabled,
@@ -233,7 +261,7 @@ contract RBTCGasStation is ReentrancyGuard {
         return rate;
     }
 
-    // ── Internal swap math (unchanged from the original) ────────────────────
+    // ── Internal swap math (legacy path) ────────────────────────────────────
 
     function _swap(address token, uint256 rateTokenPerRBTC, uint256 tokenAmountIn, uint256 minRBTCExpected) internal {
         require(tokenAmountIn > 0, "GasStation: zero input");
@@ -257,16 +285,12 @@ contract RBTCGasStation is ReentrancyGuard {
         emit Swapped(msg.sender, token, tokenAmountIn, rbtcOut, feeRBTC);
     }
 
-    // ── View helpers (SAME names/signatures the frontend already calls) ────
+    // ── View helpers ────────────────────────────────────────────────────────
 
-    /// @notice Effective current rate for USDRIF — oracle-derived if enabled.
-    /// Same external signature as the old public state variable, so the
-    /// existing frontend code needs zero changes to keep reading this.
     function usdrifPerRBTC() external view returns (uint256) {
         return usdrifOracleEnabled ? _peekOnly(usdrifPriceFeed) : manualUsdrifPerRBTC;
     }
 
-    /// @notice Effective current rate for RIF — oracle-derived if enabled.
     function rifPerRBTC() external view returns (uint256) {
         return rifOracleEnabled ? _peekOnly(rifPriceFeed) : manualRifPerRBTC;
     }
@@ -308,6 +332,16 @@ contract RBTCGasStation is ReentrancyGuard {
 
     // ── Owner Admin ──────────────────────────────────────────────────────────
 
+    function setQuoteSigner(address signer) external onlyOwner {
+        quoteSigner = signer;
+        emit QuoteSignerUpdated(signer);
+    }
+
+    function setMaxQuoteDeviationBps(uint256 bps) external onlyOwner {
+        require(bps > 0 && bps <= 2_000, "GasStation: invalid bps");
+        maxQuoteDeviationBps = bps;
+    }
+
     function setUSDRIFPriceFeed(address feed) external onlyOwner {
         usdrifPriceFeed = IMoCBaseOracle(feed);
         emit PriceFeedUpdated(usdrifToken, feed);
@@ -318,9 +352,6 @@ contract RBTCGasStation is ReentrancyGuard {
         emit PriceFeedUpdated(rifToken, feed);
     }
 
-    /// @notice Toggle oracle mode per token. Turning it off falls back to
-    /// the manual rate — use only as an emergency measure, and re-check
-    /// `manualUsdrifPerRBTC`/`manualRifPerRBTC` are fresh before doing so.
     function setOracleEnabled(address token, bool enabled) external onlyOwner {
         if (token == usdrifToken) {
             usdrifOracleEnabled = enabled;
@@ -332,9 +363,6 @@ contract RBTCGasStation is ReentrancyGuard {
         emit OracleModeSet(token, enabled);
     }
 
-    /// @notice Emergency/keeper-driven manual rate — only takes effect while
-    /// that token's oracle mode is off. Callable by owner OR the priceUpdater
-    /// bot, so an automated keeper key never needs owner-level privileges.
     function setUSDRIFRate(uint256 newRate) external onlyOwnerOrUpdater {
         require(newRate > 0, "GasStation: zero rate");
         manualUsdrifPerRBTC = newRate;
@@ -347,7 +375,6 @@ contract RBTCGasStation is ReentrancyGuard {
         emit RateUpdated(rifToken, newRate);
     }
 
-    /// @notice Set (or revoke, with address(0)) the automated price-keeper address.
     function setPriceUpdater(address _updater) external onlyOwner {
         emit PriceUpdaterChanged(priceUpdater, _updater);
         priceUpdater = _updater;
@@ -358,9 +385,6 @@ contract RBTCGasStation is ReentrancyGuard {
         maxDeviationBps = bps;
     }
 
-    /// @notice After a CircuitBreakerTripped event, the owner reviews the
-    /// move off-chain and calls this to accept the oracle's current price
-    /// as the new baseline, unblocking swaps for that token again.
     function acknowledgeRate(address token) external onlyOwner {
         if (token == usdrifToken) {
             lastUsdrifRate = _peekOnly(usdrifPriceFeed);

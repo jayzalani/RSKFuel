@@ -10,8 +10,8 @@ async function main() {
     "RBTC"
   );
 
-  const USDRIF_ADDRESS  = "0x19f64674d8a5b4e652319f5e239efd3bc969a1fe";
-  const RIF_ADDRESS     = "0x19f64674d8a5b4e652319f5e239efd3bc969a1fe";
+  const USDRIF_ADDRESS  = "0x2989Db925a901E2F1c8c73d3b3d9C86b650B511E";
+  const RIF_ADDRESS     = "0x7b6f16cF8F1A0796Ac2d056da5D6C43dfe0e2539";
 
   // ── Oracle feeds ───────────────────────────────────────────────────────
   // Set these to the real, verified IMoCBaseOracle-compatible feed addresses

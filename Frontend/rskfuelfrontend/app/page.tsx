@@ -4,6 +4,7 @@ import { useContractState } from "@/hooks/useContractState";
 import { Header } from "@/components/Header";
 import { StatsBar } from "@/components/StatsBar";
 import { SwapCard } from "@/components/SwapCard";
+import { LivePrices } from "@/components/LivePrices";
 
 export default function Home() {
   const wallet   = useWallet();
@@ -103,7 +104,7 @@ export default function Home() {
               Receive RBTC gas instantly — no bridges, no waiting.
             </p>
           </div>
-
+          <LivePrices />
           <StatsBar c={contract} />
           <SwapCard wallet={wallet} contract={contract} />
         </div>
